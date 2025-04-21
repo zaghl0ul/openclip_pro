@@ -1,0 +1,6 @@
+libgl1-mesa-glx         # Required for OpenCV (cv2)
+libglib2.0-0            # Prevents crashes with some video/image ops
+ffmpeg                  # Needed for video slicing, audio extraction, previews
+libsm6                  # Helps matplotlib/OpenCV
+libxext6                # OpenCV GUI deps
+libxrender1             # Same here
