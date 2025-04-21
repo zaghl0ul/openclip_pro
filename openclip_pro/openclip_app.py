@@ -98,12 +98,8 @@ st.set_page_config(
 
 # --- UI Imports ---
 # Import page functions from the ui package
-from ui import (
-    home_page,
-    create_project_page,
-    projects_list_page,
-    project_details_page,
-    settings_page,
+from ui import home_page, projects_list_page
+from ui.create_project_page import create_project_page  # <- direct import instead
     # api_keys_page # REMOVED - now uses ui_components
 )
 
