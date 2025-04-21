@@ -1,0 +1,533 @@
+import os
+import sqlite3
+import json
+import logging
+from typing import Dict, List, Optional
+import time
+import uuid  # Import uuid
+
+from config import DB_FILE
+
+logger = logging.getLogger(__name__)
+
+
+def setup_database():
+    """Initialize the SQLite database with required tables."""
+    conn = None
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # Create settings table
+        cursor.execute(
+            """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+        )
+
+        # Create projects table
+        cursor.execute(
+            """
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            base_dir_path TEXT NOT NULL,
+            -- Store a reference to the top clip for quick preview in lists
+            top_clip_id TEXT,
+            data JSON -- Store additional project data as JSON
+        )
+        """
+        )
+
+        # Create clips table (separate from project JSON data for better query performance)
+        cursor.execute(
+            """
+        CREATE TABLE IF NOT EXISTS clips (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            start REAL NOT NULL,
+            end REAL NOT NULL,
+            score INTEGER NOT NULL,
+            tag TEXT,
+            category TEXT,
+            clip_path TEXT, -- Path to the actual generated video file for this clip
+            thumbnail TEXT, -- Path to the thumbnail image file for this clip
+            data JSON, -- Store full clip data including AI analysis results, etc.
+            FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE
+        )
+        """
+        )
+
+        # Add default settings if not exists
+        _initialize_default_settings(cursor)
+
+        conn.commit()
+        logger.info("Database setup completed successfully.")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error during database setup: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during database setup: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+def _initialize_default_settings(cursor):
+    """Add default settings to the database if not present."""
+    default_settings = {
+        "app_version": "1.1",  # Store app version in settings
+        "default_project_name": "Project %Y-%m-%d",
+        "default_clip_length": "60",
+        "default_frame_sample_rate": "2.5",
+        "default_score_threshold": "75",
+        "default_ai_provider": "openai",  # Can be changed based on available models
+        "default_ai_model": "gpt-4o",  # Default model, can be customized
+        "export_format": "web_optimized",
+        "compression_quality": "85",
+        "max_resolution": "720",
+        "max_workers_extraction": "4",
+        "max_workers_encoding": "4",
+        "max_workers_api": "8",
+        "max_workers_clip_gen": "4",
+        "default_theme": "dark",
+    }
+
+    # Add any new defaults without overwriting existing ones
+    for key, value in default_settings.items():
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        except sqlite3.Error as e:
+            logger.error(f"Error inserting default setting {key}: {e}", exc_info=True)
+
+
+def get_settings() -> Dict[str, str]:
+    """Get all application settings."""
+    conn = None
+    settings = {}
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        settings = dict(cursor.fetchall())
+        logger.debug(f"Fetched {len(settings)} settings.")
+    except sqlite3.Error as e:
+        logger.error(f"Error getting settings: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Unexpected error getting settings: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+    return settings
+
+
+def save_setting(key: str, value: str) -> bool:
+    """Save a single setting."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # Check if setting already exists and has the same value
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        existing = cursor.fetchone()
+
+        if existing is not None and str(existing[0]) == str(value):
+            # Value hasn't changed (compare as strings)
+            logger.debug(f"Setting '{key}' value already '{value}', no update needed.")
+            return False  # Indicate no change made
+
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(value)),  # Ensure value is stored as TEXT
+        )
+        conn.commit()
+        logger.info(f"Setting '{key}' saved with value '{value}'.")
+        return True  # Indicate change was made
+    except sqlite3.Error as e:
+        logger.error(f"Error saving setting {key}: {e}", exc_info=True)
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error saving setting {key}: {e}", exc_info=True)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def save_project(project_data: Dict) -> bool:
+    """Save or update a project and its clips."""
+    conn = None
+    project_id = project_data.get("id")
+
+    if not project_id:
+        logger.error("Cannot save project: Missing project ID")
+        return False
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row  # Use row factory for easier access
+        cursor = conn.cursor()
+
+        # Start transaction
+        conn.execute("BEGIN TRANSACTION")
+
+        # Extract clips data - important: pop removes clips from project_data for JSON storage
+        clips = project_data.pop("clips", [])
+
+        # Find the top clip ID if clips were provided and not empty
+        top_clip_id = None
+        if clips:
+            # Clips are expected to be sorted by score DESC before saving if this is for initial load
+            # Or we can find the max score clip here
+            top_clip = max(clips, key=lambda c: c.get("score", 0), default=None)
+            if top_clip:
+                top_clip_id = top_clip.get("id")  # Ensure clip has an ID
+
+        # Prepare project data for saving
+        project_record = {
+            "id": project_id,
+            "name": project_data.get("name", "Untitled Project"),
+            "created_at": project_data.get(
+                "created_at", time.strftime("%Y-%m-%dT%H:%M:%S")
+            ),
+            "source_type": project_data.get("source_type", "unknown"),
+            "source_path": project_data.get("source_path", ""),
+            "base_dir_path": project_data.get("base_dir_path", ""),
+            "top_clip_id": top_clip_id,  # Store the top clip ID
+            "data": json.dumps(project_data),  # Store remaining project data as JSON
+        }
+
+        # Check if project exists
+        cursor.execute("SELECT id FROM projects WHERE id = ?", (project_id,))
+        exists = cursor.fetchone()
+
+        if exists:
+            # Update existing project
+            cursor.execute(
+                """
+            UPDATE projects
+            SET name = ?, created_at = ?, source_type = ?, source_path = ?,
+                base_dir_path = ?, top_clip_id = ?, data = ?
+            WHERE id = ?
+            """,
+                (
+                    project_record["name"],
+                    project_record["created_at"],
+                    project_record["source_type"],
+                    project_record["source_path"],
+                    project_record["base_dir_path"],
+                    project_record["top_clip_id"],
+                    project_record["data"],
+                    project_id,
+                ),
+            )
+            logger.info(f"Updated project {project_id} in database")
+        else:
+            # Insert new project
+            cursor.execute(
+                """
+            INSERT INTO projects (id, name, created_at, source_type, source_path, base_dir_path, top_clip_id, data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    project_record["id"],
+                    project_record["name"],
+                    project_record["created_at"],
+                    project_record["source_type"],
+                    project_record["source_path"],
+                    project_record["base_dir_path"],
+                    project_record["top_clip_id"],
+                    project_record["data"],
+                ),
+            )
+            logger.info(f"Inserted new project {project_id} in database")
+
+        # Handle clips if provided in the input dictionary
+        # Note: This logic assumes that if clips are provided in the input,
+        # it means we are saving the *entire* set of clips for the project.
+        # If you need to add/update/delete individual clips, separate functions are better.
+        if clips:
+            # Clear existing clips for this project
+            cursor.execute("DELETE FROM clips WHERE project_id = ?", (project_id,))
+            logger.debug(f"Deleted existing clips for project {project_id}")
+
+            # Insert all provided clips
+            clip_data_to_insert = []
+            for clip in clips:
+                # Assign a clip ID if missing (should be assigned during analysis)
+                clip_id = clip.get("id") or str(uuid.uuid4())
+                clip["id"] = clip_id  # Ensure ID is in the JSON data too
+
+                # Prepare core fields + JSON data
+                clip_data_to_insert.append(
+                    (
+                        clip_id,
+                        project_id,
+                        clip.get("start", 0),
+                        clip.get("end", 0),
+                        clip.get("score", 0),
+                        clip.get("tag", ""),
+                        clip.get("category", ""),
+                        clip.get("clip_path"),  # Can be None
+                        clip.get("thumbnail"),  # Can be None
+                        json.dumps(clip),  # Store full clip data as JSON
+                    )
+                )
+
+            # Use executemany for efficiency
+            if clip_data_to_insert:
+                cursor.executemany(
+                    """
+                INSERT INTO clips (id, project_id, start, end, score, tag, category, clip_path, thumbnail, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    clip_data_to_insert,
+                )
+                logger.info(f"Inserted {len(clips)} clips for project {project_id}")
+            else:
+                logger.info(f"No clips provided to save for project {project_id}")
+
+        # Commit transaction
+        conn.commit()
+        return True
+
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error saving project {project_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error saving project {project_id}: {e}", exc_info=True
+        )
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def update_clip_data(clip_id: str, updates: Dict) -> bool:
+    """Update the JSON data column of a single clip."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT data FROM clips WHERE id = ?", (clip_id,))
+        result = cursor.fetchone()
+        if not result:
+            logger.warning(f"Clip {clip_id} not found for update.")
+            return False
+
+        current_data = json.loads(result[0])
+        current_data.update(updates)
+
+        cursor.execute(
+            "UPDATE clips SET data = ? WHERE id = ?",
+            (json.dumps(current_data), clip_id),
+        )
+
+        # Also update core columns if relevant fields were updated in JSON
+        core_fields_to_update = {}
+        if "score" in updates:
+            core_fields_to_update["score"] = updates["score"]
+        if "tag" in updates:
+            core_fields_to_update["tag"] = updates["tag"]
+        if "category" in updates:
+            core_fields_to_update["category"] = updates["category"]
+        # Add other core fields if needed
+
+        if core_fields_to_update:
+            set_clause = ", ".join([f"{k} = ?" for k in core_fields_to_update.keys()])
+            values = list(core_fields_to_update.values()) + [clip_id]
+            cursor.execute(f"UPDATE clips SET {set_clause} WHERE id = ?", values)
+
+        conn.commit()
+        logger.info(f"Updated clip {clip_id}.")
+        return True
+
+    except (sqlite3.Error, json.JSONDecodeError) as e:
+        logger.error(f"Error updating clip {clip_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error updating clip {clip_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# Alias save_ai_analysis_to_clip to the more general update_clip_data if it only updates data
+save_ai_analysis_to_clip = update_clip_data  # Use the more general function
+
+
+def load_projects() -> List[Dict]:
+    """Load a list of all projects with basic metadata and top clip info."""
+    conn = None
+    projects = []
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Query to get project info + clip count + top clip thumbnail and score
+        # Using a LEFT JOIN with a subquery that finds the top clip for each project
+        cursor.execute(
+            """
+        SELECT
+            p.id,
+            p.name,
+            p.created_at,
+            p.source_type,
+            p.source_path,
+            p.base_dir_path,
+            COUNT(c.id) as clip_count,
+            -- Join with the top clip to get its thumbnail and score
+            tci.thumbnail as top_clip_thumbnail,
+            tci.score as top_clip_score
+        FROM projects p
+        LEFT JOIN clips c ON p.id = c.project_id
+        LEFT JOIN clips tci ON p.top_clip_id = tci.id -- Join using the stored top_clip_id
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+        """
+        )
+
+        projects = [dict(row) for row in cursor.fetchall()]
+        logger.info(f"Loaded {len(projects)} project headers with top clip info.")
+        return projects
+
+    except sqlite3.Error as e:
+        logger.error(f"Error loading projects: {e}", exc_info=True)
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error loading projects: {e}", exc_info=True)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def load_project(project_id: str) -> Optional[Dict]:
+    """Load a full project with all its clips."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get project data
+        cursor.execute("SELECT data FROM projects WHERE id = ?", (project_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            logger.warning(f"Project {project_id} not found")
+            return None
+
+        # Load the JSON data which contains most project info
+        project_data = json.loads(result["data"])  # Use row factory access
+
+        # Ensure core fields are present (they might be needed even if not in JSON)
+        # This could be redundant if data JSON always contains them, but adds safety
+        project_data["id"] = project_id
+        if "name" not in project_data:
+            cursor.execute("SELECT name FROM projects WHERE id = ?", (project_id,))
+            name_row = cursor.fetchone()
+            if name_row:
+                project_data["name"] = name_row["name"]
+
+        # Get all clips for this project, including their full JSON data
+        cursor.execute(
+            "SELECT data FROM clips WHERE project_id = ? ORDER BY score DESC",
+            (project_id,),
+        )
+        clips = [
+            json.loads(row["data"]) for row in cursor.fetchall()
+        ]  # Load data from JSON column
+
+        project_data["clips"] = clips
+        logger.info(f"Loaded project {project_id} with {len(clips)} clips")
+
+        return project_data
+
+    except (sqlite3.Error, json.JSONDecodeError) as e:
+        logger.error(f"Error loading project {project_id}: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(
+            f"Unexpected error loading project {project_id}: {e}", exc_info=True
+        )
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def delete_project(project_id: str) -> bool:
+    """Delete a project and all its clips."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # Start transaction
+        conn.execute("BEGIN TRANSACTION")
+
+        # Delete clips first (cascade should handle this, but explicit is safer)
+        # cursor.execute("DELETE FROM clips WHERE project_id = ?", (project_id,))
+        # clips_deleted = cursor.rowcount
+
+        # Then delete project (clips will be deleted due to ON DELETE CASCADE)
+        cursor.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        project_deleted = cursor.rowcount > 0
+
+        conn.commit()
+
+        if project_deleted:
+            # Note: clip count is less relevant here if cascade handles it
+            logger.info(f"Deleted project {project_id}")
+        else:
+            logger.warning(f"Project {project_id} not found for deletion")
+
+        return project_deleted
+
+    except sqlite3.Error as e:
+        logger.error(f"Error deleting project {project_id}: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return False
+    except Exception as e:
+        logger.error(
+            f"Unexpected error deleting project {project_id}: {e}", exc_info=True
+        )
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()

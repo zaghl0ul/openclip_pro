@@ -1,0 +1,518 @@
+# Contains UI generation functions related to AI configuration
+import streamlit as st
+from typing import Dict
+
+# Import specific classes needed, not the whole module if possible
+# Ensure correct import paths
+from ai.ai_models import (
+    ModelRegistry,
+    APIKeyManager,
+)  # Import AIAnalysisModule
+
+# Constants for session state keys used by the AI UI components
+SESSION_KEY_AI_UI_PREFIX = "ai_ui_state_"  # Prefix to avoid key collisions
+SESSION_KEY_ACTIVE_PROVIDER = SESSION_KEY_AI_UI_PREFIX + "active_provider"
+SESSION_KEY_ACTIVE_MODEL = SESSION_KEY_AI_UI_PREFIX + "active_model"
+SESSION_KEY_BOARD_ENABLED = SESSION_KEY_AI_UI_PREFIX + "board_enabled"
+SESSION_KEY_BOARD_MEMBERS = SESSION_KEY_AI_UI_PREFIX + "board_members"
+SESSION_KEY_BOARD_TASKS = SESSION_KEY_AI_UI_PREFIX + "board_tasks"
+SESSION_KEY_CHAIRPERSON = SESSION_KEY_AI_UI_PREFIX + "chairperson"
+
+
+def create_model_selection_ui(
+    model_registry: ModelRegistry, key_manager: APIKeyManager
+) -> Dict:
+    """
+    Render UI for selecting AI models and board config in Streamlit sidebar.
+
+    Args:
+        model_registry: An instance of ModelRegistry.
+        key_manager: An instance of APIKeyManager.
+
+    Returns:
+        Dictionary containing the selected primary model config and board config.
+    """
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧠 AI Model Configuration")
+
+    # --- Primary Model Selection ---
+    st.sidebar.subheader("Primary Analysis Model")
+    providers = model_registry.list_providers()
+    if not providers:
+        st.sidebar.warning(
+            "No AI providers available. Check dependencies and console logs."
+        )
+        return {}  # Return empty config if no providers are available
+
+    # Initialize session state for selection if not already present
+    if SESSION_KEY_ACTIVE_PROVIDER not in st.session_state:
+        # Use the first available provider as default
+        st.session_state[SESSION_KEY_ACTIVE_PROVIDER] = providers[0]
+
+    # Use the value from session state for the default selection
+    default_provider = st.session_state[SESSION_KEY_ACTIVE_PROVIDER]
+    # Ensure default is still in the available list (might change if dependencies disappear)
+    if default_provider not in providers:
+        default_provider = providers[0]  # Fallback to first available
+        st.session_state[SESSION_KEY_ACTIVE_PROVIDER] = default_provider  # Update state
+
+    provider_index = providers.index(default_provider)
+
+    selected_provider = st.sidebar.selectbox(
+        "Select AI Provider",
+        providers,
+        index=provider_index,
+        key="primary_provider_select",
+    )
+    # Always update session state to reflect the current selection
+    st.session_state[SESSION_KEY_ACTIVE_PROVIDER] = selected_provider
+
+    # Get models for the selected provider
+    models = model_registry.list_models_for_provider(selected_provider)
+    if not models:
+        st.sidebar.warning(
+            f"No known models listed for provider '{selected_provider}'. Check ModelRegistry."
+        )
+        primary_config = {
+            "provider": selected_provider,
+            "model": "None",
+        }  # Indicate no model selected
+    else:
+        # Initialize session state for model selection if not already present
+        if SESSION_KEY_ACTIVE_MODEL not in st.session_state:
+            st.session_state[SESSION_KEY_ACTIVE_MODEL] = models[
+                0
+            ]  # Default to first model
+
+        # Use value from session state for default selection
+        default_model = st.session_state[SESSION_KEY_ACTIVE_MODEL]
+        # Ensure default model is still in the list for the currently selected provider
+        if default_model not in models:
+            default_model = models[0]  # Fallback to first model of the new provider
+            st.session_state[SESSION_KEY_ACTIVE_MODEL] = default_model  # Update state
+
+        model_index = models.index(default_model)
+
+        selected_model = st.sidebar.selectbox(
+            "Select Model", models, index=model_index, key="primary_model_select"
+        )
+        # Always update session state
+        st.session_state[SESSION_KEY_ACTIVE_MODEL] = selected_model
+        primary_config = {"provider": selected_provider, "model": selected_model}
+
+        # Display model info and API key status
+        model_info = model_registry.get_model_info(selected_provider, selected_model)
+        if model_info:
+            # Display capabilities and quality
+            cap_str = ", ".join(model_info.get("capabilities", [])) or "N/A"
+            st.sidebar.caption(
+                f"Type: {model_info.get('type', 'N/A')}, Quality: {model_info.get('quality', 'N/A')}"
+            )
+            st.sidebar.caption(f"Capabilities: {cap_str}")
+
+            # Check API key requirement and availability
+            if model_info.get("requires_api_key", True):
+                if not key_manager.get_key(selected_provider):
+                    st.sidebar.error(
+                        f"⚠️ API key needed for {selected_provider.capitalize()}!"
+                    )
+                    st.sidebar.caption("Add/check key in '🔑 API Keys' section.")
+                else:
+                    st.sidebar.success(
+                        f"✅ API key found for {selected_provider.capitalize()}."
+                    )
+            else:
+                st.sidebar.info(
+                    f"🔑 {selected_provider.capitalize()} models typically don't require an API key (e.g., local Ollama)."
+                )
+
+    # --- Board of Directors Configuration ---
+    st.sidebar.subheader("AI Board of Directors")
+    # Initialize board state
+    if SESSION_KEY_BOARD_ENABLED not in st.session_state:
+        st.session_state[SESSION_KEY_BOARD_ENABLED] = False
+    if SESSION_KEY_BOARD_MEMBERS not in st.session_state:
+        st.session_state[SESSION_KEY_BOARD_MEMBERS] = []
+    if SESSION_KEY_BOARD_TASKS not in st.session_state:
+        st.session_state[SESSION_KEY_BOARD_TASKS] = [
+            "viral_analysis",
+            "monetization_analysis",
+        ]  # Default tasks
+    if SESSION_KEY_CHAIRPERSON not in st.session_state:
+        st.session_state[SESSION_KEY_CHAIRPERSON] = None
+
+    enable_board = st.sidebar.toggle(
+        "Enable AI Board",
+        value=st.session_state[SESSION_KEY_BOARD_ENABLED],
+        key="enable_board_toggle",
+    )
+    st.session_state[SESSION_KEY_BOARD_ENABLED] = enable_board  # Update state
+
+    # Prepare board_config dictionary
+    board_config = {"board_enabled": enable_board}
+
+    if enable_board:
+        st.sidebar.markdown("Select board members:")
+
+        # Get all potential models that support vision (as board analysis is typically vision-based)
+        # and for which an API key is available if required, or that are free.
+        available_models_for_board = []
+        providers_with_keys = (
+            key_manager.list_providers_with_keys()
+        )  # List providers with *any* key
+        vision_models = (
+            model_registry.list_vision_models()
+        )  # List models supporting vision
+
+        for model_info in vision_models:
+            provider = model_info["provider"]
+            model_name = model_info["model"]
+            requires_key = model_info.get("requires_api_key", True)
+
+            # Include if free OR requires a key and a key is found for the provider
+            if not requires_key or provider.lower() in [
+                p.lower() for p in providers_with_keys
+            ]:
+                available_models_for_board.append(
+                    {"provider": provider, "model": model_name}
+                )
+            else:
+                logger.debug(
+                    f"Skipping board candidate {provider}:{model_name} - API key required but not found."
+                )
+
+        if not available_models_for_board:
+            st.sidebar.warning(
+                "No vision models available for the board (check API keys for paid models, or Ollama connection for local)."
+            )
+            board_config["board_members"] = []
+            board_config["chairperson"] = None
+            st.session_state[SESSION_KEY_BOARD_MEMBERS] = []
+            st.session_state[SESSION_KEY_CHAIRPERSON] = None
+
+        else:
+            # Use stored board members from session state
+            default_board_members_dicts = st.session_state[SESSION_KEY_BOARD_MEMBERS]
+            # Convert stored dicts to strings for multiselect default
+            default_board_members_strings = [
+                f"{m['provider']}:{m['model']}"
+                for m in default_board_members_dicts
+                if {"provider": m["provider"], "model": m["model"]}
+                in available_models_for_board
+            ]
+
+            # Convert available models to strings for multiselect options
+            available_board_options = sorted(
+                [f"{m['provider']}:{m['model']}" for m in available_models_for_board]
+            )
+
+            selected_member_strings = st.sidebar.multiselect(
+                "Board Members",
+                options=available_board_options,
+                default=default_board_members_strings,  # Set default from state
+                key="board_members_multiselect",
+            )
+
+            # Convert selected strings back to list of dicts
+            board_members = []
+            for item in selected_member_strings:
+                try:
+                    prov, mod = item.split(":", 1)
+                    board_members.append({"provider": prov, "model": mod})
+                except ValueError:
+                    logger.warning(
+                        f"Invalid model format skipped in board members multiselect: {item}"
+                    )
+            board_config["board_members"] = board_members
+            st.session_state[SESSION_KEY_BOARD_MEMBERS] = (
+                board_members  # Save structured data to state
+            )
+
+            # --- Advanced Board Settings Expander ---
+            with st.sidebar.expander("Advanced Board Settings"):
+                # Chairperson Selection - Only list selected board members as options
+                chairperson_options = [
+                    f"{m['provider']}:{m['model']}" for m in board_members
+                ]
+                if chairperson_options:
+                    # Use stored chairperson from session state
+                    default_chairperson_dict = st.session_state[SESSION_KEY_CHAIRPERSON]
+                    # Format default chairperson as string if it exists, otherwise use the first option
+                    default_chair_str = None
+                    if default_chairperson_dict:
+                        default_chair_str = f"{default_chairperson_dict['provider']}:{default_chairperson_dict['model']}"
+                        # Ensure the default chairperson is actually one of the selected members
+                        if default_chair_str not in chairperson_options:
+                            default_chair_str = None  # Fallback if stored chair isn't selected or available
+
+                    # Find index of default chairperson, fallback to 0 if not found
+                    chair_index = (
+                        chairperson_options.index(default_chair_str)
+                        if default_chair_str in chairperson_options
+                        else 0
+                    )
+
+                    chairperson_selection_str = st.selectbox(
+                        "Chairperson (Synthesizes Results)",
+                        options=chairperson_options,
+                        index=chair_index,
+                        key="chairperson_select",
+                    )
+                    # Convert selected string back to dict
+                    prov, mod = chairperson_selection_str.split(":", 1)
+                    board_config["chairperson"] = {"provider": prov, "model": mod}
+                    st.session_state[SESSION_KEY_CHAIRPERSON] = board_config[
+                        "chairperson"
+                    ]  # Save to state
+                else:
+                    st.caption("Select board members above to choose a chairperson.")
+                    board_config["chairperson"] = None  # No members, no chairperson
+                    st.session_state[SESSION_KEY_CHAIRPERSON] = None  # Clear state
+
+                # Task Selection
+                # Define available board task types
+                board_task_types = [
+                    "viral_analysis",
+                    "monetization_analysis",
+                ]  # Add others like "thumbnail_selection", "hook_analysis", "audience_analysis" later
+                # Use stored tasks from session state
+                default_tasks = st.session_state[SESSION_KEY_BOARD_TASKS]
+                # Filter default tasks to ensure they are still valid task types
+                valid_default_tasks = [
+                    t for t in default_tasks if t in board_task_types
+                ]
+
+                selected_tasks = st.multiselect(
+                    "Board Tasks",
+                    options=board_task_types,
+                    default=valid_default_tasks,  # Set default from state
+                    key="board_tasks_multiselect",
+                )
+                board_config["board_tasks"] = selected_tasks
+                st.session_state[SESSION_KEY_BOARD_TASKS] = (
+                    selected_tasks  # Save to state
+                )
+
+    # --- Quick Setup Button ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🚀 Quick Setup")
+    st.sidebar.caption("Easily configure AI settings with one click.")
+
+    if st.sidebar.button("Use Only Free Models", key="use_free_models_button"):
+        free_models_list = (
+            model_registry.list_free_models()
+        )  # Get list of free models from registry
+        if free_models_list:
+            # Prioritize vision models for primary analysis if available
+            free_vision_models = [
+                m for m in free_models_list if "image" in m.get("capabilities", [])
+            ]
+            if free_vision_models:
+                # Use the highest quality free vision model for primary if available
+                free_vision_models.sort(
+                    key=lambda x: x.get("quality", "standard"), reverse=True
+                )  # Sort by quality (premium > standard > fast)
+                primary_model_info = free_vision_models[0]
+            elif free_models_list:
+                # Fallback to any free model if no vision model available
+                primary_model_info = free_models_list[0]
+            else:
+                st.sidebar.warning("No free models available to configure.")
+                return  # Exit if no free models
+
+            # Set primary model
+            st.session_state[SESSION_KEY_ACTIVE_PROVIDER] = primary_model_info[
+                "provider"
+            ]
+            st.session_state[SESSION_KEY_ACTIVE_MODEL] = primary_model_info["model"]
+            logger.info(
+                f"Set primary AI model to free model: {primary_model_info['provider']}:{primary_model_info['model']}"
+            )
+
+            # Enable board with all available free vision models (up to a limit)
+            board_members_free_vision = free_vision_models[
+                :3
+            ]  # Use up to 3 free vision models for the board
+            if board_members_free_vision:
+                st.session_state[SESSION_KEY_BOARD_ENABLED] = True
+                board_members_dicts = [
+                    {"provider": m["provider"], "model": m["model"]}
+                    for m in board_members_free_vision
+                ]
+                st.session_state[SESSION_KEY_BOARD_MEMBERS] = board_members_dicts
+
+                # Set chairperson to the first board member
+                st.session_state[SESSION_KEY_CHAIRPERSON] = board_members_dicts[0]
+                logger.info(
+                    f"Enabled AI Board with free members: {board_members_dicts}"
+                )
+            else:
+                # If no free vision models, disable the board
+                st.session_state[SESSION_KEY_BOARD_ENABLED] = False
+                st.session_state[SESSION_KEY_BOARD_MEMBERS] = []
+                st.session_state[SESSION_KEY_CHAIRPERSON] = None
+                st.sidebar.info("No free vision models available to enable AI Board.")
+
+            # Set default board tasks (if board is enabled)
+            if st.session_state[SESSION_KEY_BOARD_ENABLED]:
+                st.session_state[SESSION_KEY_BOARD_TASKS] = [
+                    "viral_analysis",
+                    "monetization_analysis",
+                ]  # Default tasks
+
+            st.success("Configured to use free models.")
+            st.rerun()  # Rerun to update UI based on new session state
+        else:
+            st.sidebar.warning("No free models seem to be available in the registry.")
+
+    # Return the combined configuration (primarily for reference, state holds the source of truth)
+    board_config["board_members"] = st.session_state[
+        SESSION_KEY_BOARD_MEMBERS
+    ]  # Ensure return uses latest state
+    board_config["chairperson"] = st.session_state[SESSION_KEY_CHAIRPERSON]
+    board_config["board_tasks"] = st.session_state[SESSION_KEY_BOARD_TASKS]
+
+    final_config = {"primary": primary_config, **board_config}
+    return final_config
+
+
+def create_api_key_management_ui(
+    key_manager: APIKeyManager, model_registry: ModelRegistry
+):
+    """
+    Render UI for API key management on a dedicated page.
+
+    Args:
+        key_manager: An instance of APIKeyManager.
+        model_registry: An instance of ModelRegistry.
+    """
+    st.title("🔑 API Key Management")
+    st.markdown(
+        "Manage API keys for different AI providers. Keys are encrypted and stored locally."
+    )
+    st.warning(
+        "Note: A hardcoded encryption key is used in this alpha version. **This is not secure for production or distributed applications.** For real-world use, the key must be managed securely (e.g., environment variable)."
+    )
+
+    # List providers that are known to require keys based on ModelRegistry
+    providers_requiring_keys = sorted(
+        [
+            prov
+            for prov, models in model_registry.KNOWN_MODELS.items()
+            # Check if ANY model for this provider requires a key
+            if any(info.get("requires_api_key", False) for info in models.values())
+        ]
+    )
+
+    if not providers_requiring_keys:
+        st.info("No configured providers require API keys.")
+        st.caption(
+            "Providers like Ollama typically run locally and do not need API keys."
+        )
+        return
+
+    # Add a note about environment variables
+    st.info(
+        "API keys can also be provided via environment variables (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`). Environment variables override saved keys."
+    )
+
+    # Check if Fernet is available before proceeding
+    if not fernet:
+        st.error("API Key encryption is not available. Cannot manage keys securely.")
+        st.warning(
+            "Please ensure the cryptography library is installed and Fernet initialization was successful (check logs)."
+        )
+        return
+
+    # Display input/status for each provider requiring a key
+    for provider in providers_requiring_keys:
+        st.subheader(f"{provider.capitalize()} API Key")
+
+        # Get the current key from the key manager (checks session, file, env)
+        current_key = key_manager.get_key(provider)
+
+        if current_key and provider.lower() != "ollama":  # Ollama key is a dummy value
+            # Display masked key
+            masked_key = (
+                "*" * (len(current_key) - 4) + current_key[-4:]
+                if len(current_key) > 4
+                else "****"
+            )
+            st.success(f"API Key is set (ending in {masked_key}).")
+
+            # Button to delete the key
+            if st.button(
+                f"Delete Key for {provider.capitalize()}", key=f"delete_{provider}_key"
+            ):
+                if key_manager.delete_key(provider):
+                    st.success(
+                        f"API Key for {provider.capitalize()} deleted successfully."
+                    )
+                    st.rerun()  # Rerun to update the UI state (show input field)
+                else:
+                    st.error(f"Failed to delete API key for {provider.capitalize()}.")
+
+            # Expander to update the key
+            with st.expander(f"Update API Key for {provider.capitalize()}"):
+                new_key = st.text_input(
+                    f"Enter New {provider.capitalize()} Key",
+                    type="password",
+                    key=f"update_input_{provider}",
+                )
+                if st.button("Save Updated Key", key=f"update_btn_{provider}"):
+                    if new_key:
+                        if key_manager.save_key(provider, new_key):
+                            st.success(
+                                f"API key for {provider.capitalize()} updated successfully!"
+                            )
+                            st.rerun()
+                        else:
+                            # save_key logs the error
+                            st.error("Failed to save updated API key.")
+                    else:
+                        st.warning("Please enter the new API key.")
+
+        elif provider.lower() == "ollama":
+            # Ollama doesn't use API keys in the traditional sense
+            st.info(
+                f"{provider.capitalize()} typically runs locally and does not require an API key."
+            )
+            st.caption(
+                "Ensure your Ollama server is running and accessible if using Ollama models."
+            )
+        else:
+            # API key is not set
+            st.warning(f"API Key for {provider.capitalize()} is not set.")
+            new_key = st.text_input(
+                f"Enter {provider.capitalize()} Key",
+                type="password",
+                key=f"input_{provider}",
+            )
+            if st.button(
+                f"Save Key for {provider.capitalize()}", key=f"save_btn_{provider}"
+            ):
+                if new_key:
+                    # Basic length validation
+                    if len(new_key.strip()) < 10:
+                        st.warning("API Key seems too short. Please double-check.")
+                    # Save the new key
+                    if key_manager.save_key(provider, new_key):
+                        st.success(
+                            f"API key for {provider.capitalize()} saved successfully!"
+                        )
+                        st.rerun()  # Rerun to update UI state (show masked key)
+                    else:
+                        # save_key logs the error
+                        st.error("Failed to save API key.")
+                else:
+                    st.warning("Please enter an API key.")
+
+        st.markdown("---")
+
+    st.markdown(
+        """
+    **Note on Storage:** API keys saved here are encrypted using a key stored with the application code (INSECURE for distribution) and saved to `~/.openclip/api_keys.json`.
+    Environment variables (e.g., `OPENAI_API_KEY`) are also checked and take precedence if set.
+    """
+    )

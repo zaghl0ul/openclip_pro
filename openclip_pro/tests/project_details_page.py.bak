@@ -1,0 +1,1183 @@
+import streamlit as st
+import os
+import time
+import datetime
+import logging
+import pandas as pd
+from matplotlib import pyplot as plt
+import io
+import base64
+import numpy as np
+import sqlite3
+from typing import List, Dict, Optional
+
+from database import load_project, delete_project, DB_FILE  # Use update_clip_data
+from media_utils import (
+    cleanup_project_directories,
+    generate_clips,
+)  # For export fallback
+from ui.components import clip_display  # Import clip display components
+
+# Import AI UI components and the AIAnalysisModule structure if needed for AI tab
+# from ai.ui_components import display_ai_board_ui # Assuming this function exists in ai/ui_components
+# from ai.ai_models import AIAnalysisModule # Import the module class structure
+
+logger = logging.getLogger(__name__)
+
+
+# --- Helper function for Analytics Plot ---
+def _create_analytics_chart(clips: List[Dict], video_duration: Optional[float] = None):
+    """
+    Generate matplotlib plot for analytics.
+    Now takes the full clips list and video duration.
+    """
+    if not clips:
+        return None
+    try:
+        plt.style.use("seaborn-v0_8-darkgrid")
+        fig, axes = plt.subplots(
+            2, 2, figsize=(14, 10), facecolor="#2E2E2E"
+        )  # Larger figure
+
+        # Data extraction for charts
+        scores = [c.get("score", 0) for c in clips]
+        durations = [max(0, c.get("end", 0) - c.get("start", 0)) for c in clips]
+        categories = {}
+        for clip in clips:
+            cat = clip.get("category", "Unknown")
+            categories[cat] = categories.get(cat, 0) + 1
+
+        # Calculate average score by category
+        avg_score_by_category = {}
+        cat_scores = {}
+        for clip in clips:
+            cat = clip.get("category", "Unknown")
+            cat_scores.setdefault(cat, []).append(clip.get("score", 0))
+        for cat, score_list in cat_scores.items():
+            avg_score_by_category[cat] = (
+                sum(score_list) / len(score_list) if score_list else 0
+            )
+
+        # Prepare timeline data (score over time)
+        timeline_data_points = []
+        # Use the start time of each clip for the timeline point
+        for clip in clips:
+            timeline_data_points.append(
+                {"time": clip.get("start", 0), "score": clip.get("score", 0)}
+            )
+        # Sort timeline data by time
+        timeline_data_points.sort(key=lambda x: x["time"])
+
+        # --- Plot 1: Score Distribution ---
+        if scores:
+            axes[0, 0].hist(
+                scores,
+                bins=range(0, 101, 10),
+                color="#4CAF50",
+                alpha=0.8,
+                edgecolor="white",
+            )  # Changed color
+        else:
+            axes[0, 0].text(
+                0.5,
+                0.5,
+                "No Score Data",
+                horizontalalignment="center",
+                verticalalignment="center",
+                color="white",
+                transform=axes[0, 0].transAxes,
+            )
+        axes[0, 0].set_title("Initial Score Distribution", color="white")
+        axes[0, 0].set_xlabel("Score", color="white")
+        axes[0, 0].set_ylabel("Frequency", color="white")
+        axes[0, 0].tick_params(colors="white", which="both")
+        axes[0, 0].set_facecolor("#3B3B3B")
+        axes[0, 0].spines["top"].set_color("white")
+        axes[0, 0].spines["right"].set_color("white")
+
+        # --- Plot 2: Category Pie Chart ---
+        if categories:
+            labels = list(categories.keys())
+            sizes = list(categories.values())
+            # Sort categories by size for better legend
+            sorted_categories = sorted(zip(sizes, labels), reverse=True)
+            sizes, labels = zip(*sorted_categories)  # Unzip back
+
+            wedges, texts, autotexts = axes[0, 1].pie(
+                sizes,
+                labels=None,
+                autopct="%1.1f%%",
+                startangle=90,
+                pctdistance=0.85,
+                colors=plt.cm.viridis.colors,
+            )  # Changed color map
+            # Create legend with correct labels and colors
+            axes[0, 1].legend(
+                wedges,
+                labels,
+                title="Categories",
+                loc="center left",
+                bbox_to_anchor=(1, 0, 0.5, 1),
+                labelcolor="white",
+            )
+            plt.setp(autotexts, size=10, weight="bold", color="white")  # Autotext color
+        else:
+            axes[0, 1].text(
+                0.5,
+                0.5,
+                "No Category Data",
+                horizontalalignment="center",
+                verticalalignment="center",
+                color="white",
+                transform=axes[0, 1].transAxes,
+            )
+        axes[0, 1].set_title("Content Categories", color="white")
+        axes[0, 1].set_facecolor("#3B3B3B")
+        axes[0, 1].spines["top"].set_color("white")
+        axes[0, 1].spines["right"].set_color("white")
+
+        # --- Plot 3: Clip Timeline (Score over time) ---
+        if timeline_data_points:
+            times = [item["time"] for item in timeline_data_points]
+            scores_tl = [
+                item["score"] for item in timeline_data_points
+            ]  # Renamed to avoid clash
+            axes[1, 0].plot(
+                times,
+                scores_tl,
+                color="#FF9800",
+                marker="o",
+                linestyle="-",
+                linewidth=2,
+            )  # Changed color
+            axes[1, 0].set_title("Initial Score Timeline", color="white")
+            axes[1, 0].set_xlabel("Time (s)", color="white")
+            axes[1, 0].set_ylabel("Score", color="white")
+            axes[1, 0].tick_params(colors="white", which="both")
+            axes[1, 0].set_facecolor("#3B3B3B")
+            axes[1, 0].grid(True, linestyle=":", alpha=0.4, color="gray")
+            axes[1, 0].spines["top"].set_color("white")
+            axes[1, 0].spines["right"].set_color("white")
+            if video_duration is not None and video_duration > 0:
+                axes[1, 0].set_xlim(0, video_duration)
+            axes[1, 0].set_ylim(0, 100)  # Ensure score axis is 0-100
+
+        # --- Plot 4: Average Score by Category ---
+        if avg_score_by_category:
+            sorted_cats = sorted(
+                avg_score_by_category.items(), key=lambda item: item[1], reverse=True
+            )
+            cats_labels = [item[0] for item in sorted_cats]
+            avg_scores_values = [item[1] for item in sorted_cats]
+            bars = axes[1, 1].bar(
+                cats_labels,
+                avg_scores_values,
+                color=plt.cm.plasma(np.linspace(0, 1, len(cats_labels))),
+                alpha=0.8,
+            )  # Changed color map
+            axes[1, 1].tick_params(axis="x", rotation=45, colors="white")
+            axes[1, 1].tick_params(axis="y", colors="white")
+            axes[1, 1].yaxis.grid(True, linestyle=":", alpha=0.4, color="gray")
+            axes[1, 1].set_ylabel("Avg Score", color="white")
+            axes[1, 1].set_facecolor("#3B3B3B")
+            axes[1, 1].set_title("Average Initial Score by Category", color="white")
+            axes[1, 1].spines["top"].set_color("white")
+            axes[1, 1].spines["right"].set_color("white")
+            axes[1, 1].set_ylim(0, 100)  # Ensure score axis is 0-100
+            plt.setp(axes[1, 1].get_xticklabels(), ha="right")  # Align rotated labels
+
+        else:
+            axes[1, 1].text(
+                0.5,
+                0.5,
+                "Not Enough Data",
+                horizontalalignment="center",
+                verticalalignment="center",
+                color="white",
+                transform=axes[1, 1].transAxes,
+            )
+            axes[1, 1].set_title("Average Initial Score by Category", color="white")
+            axes[1, 1].set_facecolor("#3B3B3B")
+            axes[1, 1].spines["top"].set_color("white")
+            axes[1, 1].spines["right"].set_color("white")
+
+        plt.tight_layout(pad=2.0)  # Increase padding between subplots
+        buf = io.BytesIO()
+        plt.savefig(
+            buf, format="png", dpi=150, facecolor=fig.get_facecolor()
+        )  # Higher DPI for clarity
+        buf.seek(0)
+        img_str = base64.b64encode(buf.read()).decode("utf-8")
+        plt.close(fig)
+        return img_str
+    except Exception as e:
+        logger.error(f"Error generating analytics plot: {e}", exc_info=True)
+        st.warning(f"Could not generate analytics visualization: {e}")
+        return None
+
+
+# --- Tab Content Functions ---
+
+
+def _show_clips_tab(project: dict):
+    """Display clips for a project with filtering, sorting, and AI data."""
+    st.subheader("🎥 Project Clips")
+    clips = project.get("clips", [])
+
+    if not clips:
+        st.info(
+            "No clips were identified during the initial analysis for this project."
+        )
+        return
+
+    # Use a unique key for the clips list based on project ID
+    clips_key = f"clips_list_{project['id']}"
+    # Store filtered/sorted clips in session state for consistency across reruns within the tab
+    if (
+        clips_key not in st.session_state
+        or st.session_state[clips_key]["original_clips"] != clips
+    ):
+        st.session_state[clips_key] = {
+            "original_clips": clips,
+            "filtered_clips": clips,  # Start with all clips
+            "min_score": 0,
+            "category_filter": [],
+            "sort_by": "Score (High-Low)",
+            "view_mode": "Gallery",
+        }
+        # logger.debug(f"Initialized clips state for project {project['id']}")
+    else:
+        # Update original clips if project data reloaded/changed (less common but safe)
+        st.session_state[clips_key]["original_clips"] = clips
+
+    # --- Filtering & Sorting Controls ---
+    filter_cols = st.columns([1, 2, 1, 2])
+    with filter_cols[0]:
+        # Use session state value for default
+        min_score_val = st.session_state[clips_key]["min_score"]
+        min_score = st.slider(
+            "Min Initial Score",
+            0,
+            100,
+            min_score_val,
+            key=f"clip_min_score_{project['id']}_ui",
+        )
+        st.session_state[clips_key]["min_score"] = min_score  # Update session state
+
+    with filter_cols[1]:
+        available_categories = sorted(
+            list(set(c.get("category", "Unknown") for c in clips if c.get("category")))
+        )
+        category_filter_val = st.session_state[clips_key]["category_filter"]
+        category_filter = st.multiselect(
+            "Filter Category",
+            options=available_categories,
+            default=category_filter_val,
+            key=f"clip_cat_filter_{project['id']}_ui",
+        )
+        st.session_state[clips_key][
+            "category_filter"
+        ] = category_filter  # Update session state
+
+    with filter_cols[2]:
+        sort_options = [
+            "Score (High-Low)",
+            "Score (Low-High)",
+            "Duration",
+            "Position",
+            "AI Viral Score",
+            "AI Monet. Score",
+        ]
+        sort_by_val = st.session_state[clips_key]["sort_by"]
+        sort_by = st.selectbox(
+            "Sort by",
+            sort_options,
+            index=sort_options.index(sort_by_val),
+            key=f"clip_sort_{project['id']}_ui",
+        )
+        st.session_state[clips_key]["sort_by"] = sort_by  # Update session state
+
+    with filter_cols[3]:
+        view_options = ["Gallery", "List", "Timeline"]
+        view_mode_val = st.session_state[clips_key]["view_mode"]
+        view_index = view_options.index(view_mode_val)
+        view_mode = st.radio(
+            "View Mode",
+            view_options,
+            index=view_index,
+            horizontal=True,
+            key=f"clip_view_mode_{project['id']}_ui",
+        )
+        st.session_state[clips_key]["view_mode"] = view_mode  # Update session state
+
+    # --- Apply Filters ---
+    filtered_clips = [c for c in clips if c.get("score", 0) >= min_score]
+    if category_filter:
+        filtered_clips = [
+            c for c in filtered_clips if c.get("category", "Unknown") in category_filter
+        ]
+
+    # --- Apply Sorting ---
+    reverse_sort = True
+
+    # Define sorting key function safely, handling potential None/missing AI scores
+    def get_sort_key(clip):
+        if sort_by == "Score (Low-High)":
+            return clip.get("score", 0)
+        elif sort_by == "Duration":
+            return max(0, clip.get("end", 0) - clip.get("start", 0))
+        elif sort_by == "Position":
+            return clip.get("start", 0)
+        elif sort_by == "AI Viral Score":
+            return clip.get("ai_viral_score", -1)  # Use -1 for missing AI scores
+        elif sort_by == "AI Monet. Score":
+            return clip.get("ai_monetization_score", -1)  # Use -1 for missing AI scores
+        # Default is "Score (High-Low)"
+        return clip.get("score", 0)
+
+    if sort_by == "Score (Low-High)" or sort_by == "Position":
+        reverse_sort = False
+    # AI scores default to 0 if not present, so sorting descending is fine if -1 is used for N/A
+
+    try:
+        filtered_clips.sort(key=get_sort_key, reverse=reverse_sort)
+        st.session_state[clips_key][
+            "filtered_clips"
+        ] = filtered_clips  # Store sorted/filtered list
+    except Exception as e:
+        st.error(
+            f"Sorting failed: {e}"
+        )  # Handle potential errors in sorting complex keys
+        st.session_state[clips_key][
+            "filtered_clips"
+        ] = filtered_clips  # Store unsorted/filtered list
+
+    st.caption(
+        f"Showing {len(st.session_state[clips_key]['filtered_clips'])} of {len(clips)} clips."
+    )
+    st.markdown("---")
+
+    if not st.session_state[clips_key]["filtered_clips"]:
+        st.info("No clips match the current filter settings.")
+        return
+
+    # --- Display based on View Mode (using components) ---
+    clips_to_display = st.session_state[clips_key]["filtered_clips"]
+
+    if view_mode == "Gallery":
+        clip_display.display_clips_gallery(clips_to_display)
+    elif view_mode == "List":
+        clip_display.display_clips_list(clips_to_display)
+    elif view_mode == "Timeline":
+        video_duration = project.get("video_info", {}).get("duration")
+        clip_display.display_clips_timeline(clips_to_display, video_duration, sort_by)
+
+
+def _show_analytics_tab(project: dict, ai_module):
+    """Display project analytics including charts and raw data."""
+    st.subheader("📊 Project Analytics")
+    clips = project.get("clips", [])
+
+    if not clips:
+        st.info("No clips available to generate analytics for this project.")
+        return
+
+    # --- Generate Analytics Data ---
+    # Generate base analytics data first
+    from media_utils import generate_clip_analytics_data as generate_base_analytics
+
+    analytics_data = generate_base_analytics(clips)
+
+    # If AI module is available, generate enhanced analytics
+    if ai_module and hasattr(ai_module, "generate_enhanced_analytics"):
+        try:
+            # Pass base data to the AI module for enhancement
+            enhanced_analytics_data = ai_module.generate_enhanced_analytics(
+                clips, project, analytics_data
+            )
+            # Use the enhanced data if successful, otherwise fallback to base
+            if enhanced_analytics_data:
+                analytics_data = enhanced_analytics_data
+                logger.debug("Generated enhanced analytics.")
+        except Exception as ai_analytics_err:
+            logger.error(
+                f"Error generating AI enhanced analytics: {ai_analytics_err}",
+                exc_info=True,
+            )
+            st.warning(f"Could not generate AI enhanced analytics: {ai_analytics_err}")
+            # Fallback to displaying base analytics
+
+    if not analytics_data:
+        st.warning("Analytics generation failed or returned no data.")
+        return
+
+    # --- Display Stats ---
+    st.markdown("### Summary Statistics")
+    stats = analytics_data.get("stats", {})
+    ai_stats = analytics_data.get("ai_stats", {})  # Get AI stats if generated
+
+    stat_cols = st.columns(4)
+    stat_cols[0].metric("Clips Identified", stats.get("total_clips", 0))
+    stat_cols[1].metric("Avg Initial Score", f"{stats.get('avg_score', 0):.1f}")
+    stat_cols[2].metric("Avg Duration", f"{stats.get('avg_duration', 0):.1f}s")
+    stat_cols[3].metric("Top Category", stats.get("top_category", "N/A"))
+
+    if ai_stats:
+        st.markdown("#### AI Analysis Insights")
+        ai_stat_cols = st.columns(4)
+        # Check if scores are actually present before displaying
+        if ai_stats.get("avg_viral_score", 0) > 0 or any(
+            c.get("ai_viral_score", 0) > 0 for c in clips
+        ):
+            ai_stat_cols[0].metric(
+                "Avg Viral Score", f"{ai_stats.get('avg_viral_score', 0):.1f}"
+            )
+        else:
+            ai_stat_cols[0].metric("Avg Viral Score", "N/A")
+
+        if ai_stats.get("avg_monetization_score", 0) > 0 or any(
+            c.get("ai_monetization_score", 0) > 0 for c in clips
+        ):
+            ai_stat_cols[1].metric(
+                "Avg Monetize Score", f"{ai_stats.get('avg_monetization_score', 0):.1f}"
+            )
+        else:
+            ai_stat_cols[1].metric("Avg Monetize Score", "N/A")
+
+        with ai_stat_cols[2]:
+            st.markdown("**Top AI Tags:**")
+            tags = ai_stats.get("top_tags", [])
+            # Display limited number of tags
+            st.caption(
+                "<br>".join(f"- {tag}" for tag in tags[:5]) if tags else "N/A",
+                unsafe_allow_html=True,
+            )  # Use <br> for line breaks
+        with ai_stat_cols[3]:
+            st.markdown("**Top AI Recs:**")
+            recs = ai_stats.get("top_recommendations", [])
+            # Display limited number of recommendations, truncated
+            st.caption(
+                "<br>".join(f"- {rec[:50]}..." for rec in recs[:3]) if recs else "N/A",
+                unsafe_allow_html=True,
+            )
+
+    # --- Display Charts ---
+    st.markdown("### Visualizations")
+    # Generate and display the base analytics chart
+    video_duration = project.get("video_info", {}).get("duration")
+    base_chart_b64 = _create_analytics_chart(
+        clips, video_duration
+    )  # Pass clips and duration
+    if base_chart_b64:
+        st.image(
+            f"data:image/png;base64,{base_chart_b64}",
+            use_column_width=True,
+            caption="Clip Analytics Overview",
+        )
+    else:
+        st.info("Base analytics chart could not be generated.")
+
+    # Display AI-enhanced chart if available (assuming AI module adds it to analytics_data)
+    ai_chart_b64 = analytics_data.get("ai_chart")
+    if ai_chart_b64:
+        st.image(
+            f"data:image/png;base64,{ai_chart_b64}",
+            use_column_width=True,
+            caption="AI-Enhanced Analytics View",
+        )
+    # No need for an else/warning here, as AI chart is optional
+
+    # --- Raw Data ---
+    st.markdown("### Raw Data")
+    with st.expander("View Raw Clip Data"):
+        # Use raw_data from the analytics_data dictionary
+        raw_data = analytics_data.get("raw_data")
+        if raw_data:
+            try:
+                # Convert list of dicts to DataFrame for display
+                df_raw = pd.DataFrame(raw_data)
+                # Define columns to display for clarity, skipping potentially large 'data' JSON
+                display_cols = [
+                    "id",
+                    "start",
+                    "end",
+                    "duration",
+                    "score",
+                    "category",
+                    "tag",
+                    "quip",
+                    "ai_viral_score",
+                    "ai_monetization_score",
+                    "ai_tags",
+                    "ai_recommendations",
+                ]
+                # Filter DataFrame columns to only include those present in the data
+                cols_to_show = [col for col in display_cols if col in df_raw.columns]
+                st.dataframe(df_raw[cols_to_show], use_container_width=True)
+            except Exception as e:
+                logger.error(
+                    f"Failed to display raw data as DataFrame: {e}", exc_info=True
+                )
+                st.error(f"Failed to display raw data: {e}")
+                # Fallback to showing sample JSON if DataFrame fails
+                st.json(raw_data[:5])  # Show sample as JSON
+        else:
+            st.info("No raw data available.")
+
+
+def _show_export_tab(project: dict, ai_module):
+    """Display the export options for a project."""
+    st.subheader("📤 Export Clips")
+    clips = project.get("clips", [])
+    project_base_dir = project.get("base_dir_path")
+    project_id = project["id"]
+
+    # --- Locate Source Video ---
+    # The original video is saved in the project's temp directory during creation
+    local_input_path = None
+    temp_dir_path = None
+    if project_base_dir:
+        temp_dir_path = os.path.join(project_base_dir, "temp")
+        if os.path.isdir(temp_dir_path):
+            # Look for typical filenames used during creation
+            possible_inputs = [
+                f
+                for f in os.listdir(temp_dir_path)
+                if f.startswith("input_") or f.startswith("downloaded_video")
+            ]
+            if possible_inputs:
+                # Assume the first found file is the source video
+                local_input_path = os.path.join(temp_dir_path, possible_inputs[0])
+                if not os.path.isfile(local_input_path):
+                    local_input_path = None  # File doesn't exist despite name
+
+    if not local_input_path:
+        st.error(
+            "❌ Critical Error: Could not locate the original source video file in the project directory. Export is disabled."
+        )
+        logger.error(
+            f"Source video not found for project {project_id} in expected path: {temp_dir_path or 'N/A'}"
+        )
+        st.caption(f"Looked for source in: {temp_dir_path}")
+        return  # Cannot export without source video
+
+    if not clips:
+        st.info("This project has no analyzed clips to export.")
+        return
+
+    # --- Selection Controls ---
+    st.markdown("#### 1. Select Clips for Export")
+    export_filter_cols = st.columns(3)
+    with export_filter_cols[0]:
+        # Default the min score to the project's creation score threshold
+        default_min_score = int(project.get("settings", {}).get("score_threshold", 0))
+        min_score_export = st.slider(
+            "Minimum Initial Score",
+            0,
+            100,
+            default_min_score,
+            key=f"export_min_score_{project_id}",
+        )
+    with export_filter_cols[1]:
+        # Check if any clips have AI scores before enabling the filter
+        has_ai_viral_scores = any(
+            c.get("ai_viral_score", None) is not None for c in clips
+        )
+        # Default min AI viral score to 0 if scores exist, otherwise 0 (disabled)
+        min_ai_viral_default = 0
+        if has_ai_viral_scores:
+            # If AI scores exist, maybe default to a higher threshold, or just 0
+            pass  # Keep default at 0
+
+        min_ai_viral = st.slider(
+            "Min AI Viral Score",
+            0,
+            100,
+            min_ai_viral_default,
+            key=f"export_min_viral_{project_id}",
+            disabled=not has_ai_viral_scores,
+            help="Only include clips with an AI Viral Score above this value (requires AI Board analysis).",
+        )
+    with export_filter_cols[2]:
+        max_clips_to_export = st.number_input(
+            "Max Clips to Export",
+            min_value=1,
+            max_value=len(clips),
+            value=min(10, len(clips)),
+            step=1,
+            key=f"export_max_clips_{project_id}",
+        )
+
+    # Apply filters and selection
+    export_clips_filtered = [
+        c
+        for c in clips
+        if c.get("score", 0) >= min_score_export
+        and (
+            not has_ai_viral_scores or c.get("ai_viral_score", -1) >= min_ai_viral
+        )  # Use -1 for clips without AI score
+    ]
+    # Sort by score before taking top N, regardless of view settings elsewhere
+    export_clips_filtered.sort(key=lambda x: x.get("score", 0), reverse=True)
+    export_clips_final = export_clips_filtered[:max_clips_to_export]
+
+    if not export_clips_final:
+        st.warning("No clips match the current selection criteria.")
+        # Provide options even if no clips match filter, maybe they want to clear filter
+        # Or just return
+        return
+
+    st.markdown(f"**Selected {len(export_clips_final)} clips for export:**")
+    # Show compact preview using the gallery component helper
+    clip_display.display_clips_gallery(
+        export_clips_final, cols=min(len(export_clips_final), 5), show_details=False
+    )  # Show max 5 columns
+
+    # --- Export Options ---
+    st.markdown("#### 2. Configure Export Options")
+    # Get default export format from project settings (saved from app settings at creation)
+    default_export_format = project.get("settings", {}).get(
+        "export_format", "web_optimized"
+    )
+    valid_formats = ["web_optimized", "high_quality", "copy_only"]
+    try:
+        default_format_index = valid_formats.index(default_export_format)
+    except ValueError:
+        default_format_index = 0  # Fallback if saved setting is invalid
+
+    export_opts_cols = st.columns(2)
+    with export_opts_cols[0]:
+        platform = st.selectbox(
+            "Optimize For Platform",
+            ["Standard Web", "Instagram", "TikTok", "Twitter", "Original"],
+            index=0,  # Default to Standard Web
+            key=f"export_platform_{project_id}",
+            help="Adjusts encoding, resolution, and aspect ratio for target platform.",
+        )
+    with export_opts_cols[1]:
+        # Use the default format saved with the project as the initial selection
+        export_format_selection = st.selectbox(
+            "Encoding Quality/Strategy",
+            valid_formats,
+            index=default_format_index,
+            key=f"export_quality_format_{project_id}",
+            help="Choose encoding settings (web_optimized = h264 low bitrate, high_quality = h264 high quality, copy_only = no re-encoding).",
+        )
+
+    # Optional advanced export settings expander
+    # with st.expander("Advanced Export Settings"):
+    #      # Resolution, aspect ratio override etc.
+    #      pass
+
+    # --- Export Action ---
+    st.markdown("#### 3. Export")
+    if st.button(
+        "🚀 Export Selected Clips",
+        type="primary",
+        use_container_width=True,
+        key=f"export_clips_btn_{project_id}",
+    ):
+        export_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Create a unique subdirectory within exports for this export batch
+        export_output_dir = os.path.join(
+            project_base_dir,
+            "exports",
+            f"{project['name'].replace(' ', '_')}_{export_timestamp}",
+        )
+        os.makedirs(export_output_dir, exist_ok=True)
+        logger.info(f"Exporting clips for project {project_id} to {export_output_dir}")
+
+        st.info(f"Starting export to: {os.path.basename(export_output_dir)}")
+        exported_files_info = []
+
+        with st.spinner(
+            f"Exporting {len(export_clips_final)} clips... This may take a while."
+        ):
+            try:
+                # Get max workers from project settings (which came from app settings)
+                max_workers_clip_gen = int(
+                    project.get("settings", {}).get("max_workers_clip_gen", 4)
+                )
+                logger.info(
+                    f"Using {max_workers_clip_gen} workers for clip generation."
+                )
+
+                # Determine export function (AI optimized or standard generate_clips)
+                # Check if the AI module provides an optimized export function
+                if ai_module and hasattr(ai_module, "export_clips_optimized"):
+                    logger.info("Using AI-optimized export function.")
+                    # Assuming export_clips_optimized takes clips, input_filepath, output_dir, platform, quality, max_workers
+                    exported_files_info = ai_module.export_clips_optimized(
+                        clips=export_clips_final,
+                        input_filepath=local_input_path,
+                        output_dir=export_output_dir,
+                        platform=platform.lower().replace(
+                            " ", "_"
+                        ),  # Pass platform preference
+                        quality=export_format_selection,  # Pass selected encoding format/quality
+                        max_workers=max_workers_clip_gen,
+                    )
+                else:
+                    logger.info("Using standard clip generation for export.")
+                    # Fallback to the standard generate_clips function from media_utils
+                    # This function expects a list of (start, end) tuples
+                    segments_to_export = [
+                        (c["start"], c["end"]) for c in export_clips_final
+                    ]
+                    exported_files_info = generate_clips(
+                        input_filepath=local_input_path,
+                        segments=segments_to_export,
+                        output_dir=export_output_dir,
+                        export_format=export_format_selection,  # Use selected format
+                        max_workers=max_workers_clip_gen,
+                    )
+
+            except Exception as export_err:
+                logger.error(
+                    f"Export process failed for project {project_id}: {export_err}",
+                    exc_info=True,
+                )
+                st.error(f"Export process encountered an error: {export_err}")
+
+        # --- Display Download Links ---
+        if exported_files_info:
+            st.success(f"Successfully exported {len(exported_files_info)} clips!")
+            st.balloons()  # Celebrate!
+            st.markdown("#### Download Exported Clips:")
+
+            # Create a list of files with sizes for sorting/display
+            files_for_download = []
+            for exported_info in exported_files_info:
+                # 'path' is used by media_utils.generate_clips, 'exported_path' might be used by AI optimized
+                file_path = exported_info.get("path") or exported_info.get(
+                    "exported_path"
+                )
+                if file_path and os.path.exists(file_path):
+                    try:
+                        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                        files_for_download.append(
+                            {
+                                "path": file_path,
+                                "name": os.path.basename(file_path),
+                                "size_mb": file_size_mb,
+                            }
+                        )
+                    except Exception as size_err:
+                        logger.warning(
+                            f"Could not get file size for {file_path}: {size_err}"
+                        )
+                        files_for_download.append(
+                            {
+                                "path": file_path,
+                                "name": os.path.basename(file_path),
+                                "size_mb": 0,
+                            }
+                        )
+                else:
+                    logger.warning(f"Exported file not found for a clip: {file_path}")
+                    # Don't add to list if file doesn't exist
+
+            if files_for_download:
+                # Optional: Sort files by size or name
+                # files_for_download.sort(key=lambda x: x['size_mb'])
+
+                # Display download buttons in columns or a list
+                dl_cols = st.columns(4)  # Use columns for buttons
+                for i, file_info in enumerate(files_for_download):
+                    with dl_cols[i % 4]:  # Distribute buttons across columns
+                        try:
+                            with open(file_info["path"], "rb") as fp:
+                                st.download_button(
+                                    label=f"{file_info['name']} ({file_info['size_mb']:.1f} MB)",
+                                    data=fp,
+                                    file_name=file_info["name"],
+                                    mime="video/mp4",  # Assume mp4 for now, could detect mime type
+                                    key=f"download_{i}_{project_id}_{export_timestamp}",  # Unique key
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"Error preparing download button for {file_info['name']}: {e}",
+                                exc_info=True,
+                            )
+                            st.error(
+                                f"Could not prepare '{file_info['name']}' for download."
+                            )
+
+            else:
+                st.warning("No export files were successfully prepared for download.")
+
+        else:
+            st.error(
+                "Clip export finished, but no files were generated successfully. Check logs for errors."
+            )
+
+
+def _show_settings_tab(project: dict, ai_module):
+    """Display and allow editing of project settings and deletion."""
+    st.subheader("🔧 Project Settings")
+    project_id = project["id"]
+    project_dir = project.get("base_dir_path")
+
+    # Reload the project to get the latest data in case of changes elsewhere
+    # This might be redundant if project dict is always fresh from load_project in show()
+    # But safer if other operations on the page could modify the project object.
+    # Let's rely on the project dict passed into the function, assuming show() loads it once.
+
+    # --- Form for Editable Settings ---
+    with st.form(key=f"project_settings_form_{project_id}"):
+        st.markdown("**Basic Information**")
+        # Use the current project name as the default value
+        new_name = st.text_input(
+            "Project Name", value=project.get("name", ""), key=f"proj_name_{project_id}"
+        )
+
+        info_cols = st.columns(2)
+        with info_cols[0]:
+            st.text_input("Project ID", value=project_id, disabled=True)
+            # Format created_at nicely
+            created_at_str = project.get("created_at", "N/A")
+            if created_at_str != "N/A":
+                try:
+                    created_at_str = datetime.datetime.fromisoformat(
+                        created_at_str
+                    ).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, TypeError):
+                    created_at_str = "Invalid Date"
+            st.text_input("Created At", value=created_at_str, disabled=True)
+
+        with info_cols[1]:
+            st.text_input(
+                "Source Type",
+                value=project.get("source_type", "N/A").capitalize(),
+                disabled=True,
+            )
+            # Display truncated source path or URL
+            source_path_display = project.get("source_path", "N/A")
+            if len(source_path_display) > 50:
+                source_path_display = "..." + source_path_display[-47:]
+            st.text_input("Source Path/URL", value=source_path_display, disabled=True)
+            st.caption(
+                f"Project Files Directory: `{project_dir or 'N/A'}`"
+            )  # Display full dir path in caption
+
+        st.markdown("---")
+        st.markdown("**Analysis Configuration Used** (Read-only for this project)")
+        st.caption(
+            "These are the settings that were used when this project was created."
+        )
+        current_settings = project.get("settings", {})
+        settings_cols = st.columns(3)  # Use 3 columns
+        with settings_cols[0]:
+            st.text_input(
+                "Segment Length (s)",
+                value=current_settings.get("chunk_size", "N/A"),
+                disabled=True,
+            )
+            st.text_input(
+                "Frame Sample Rate (s)",
+                value=current_settings.get("frame_sample_rate", "N/A"),
+                disabled=True,
+            )
+            st.text_input(
+                "Score Threshold",
+                value=current_settings.get("score_threshold", "N/A"),
+                disabled=True,
+            )
+        with settings_cols[1]:
+            st.text_input(
+                "Initial AI Provider",
+                value=current_settings.get("ai_provider", "N/A").capitalize(),
+                disabled=True,
+            )  # Capitalize provider name
+            st.text_input(
+                "Initial AI Model",
+                value=current_settings.get("ai_model", "N/A"),
+                disabled=True,
+            )
+            st.text_input(
+                "Audio Analyzed",
+                value=str(current_settings.get("analyze_audio", False)),
+                disabled=True,
+            )
+        with settings_cols[2]:
+            st.text_input(
+                "Clip Encoding Format",
+                value=current_settings.get("export_format", "N/A"),
+                disabled=True,
+            )
+            st.text_input(
+                "AI Image Quality (%)",
+                value=current_settings.get("compression_quality", "N/A"),
+                disabled=True,
+            )
+            st.text_input(
+                "AI Image Max Resolution",
+                value=current_settings.get("max_resolution", "N/A"),
+                disabled=True,
+            )
+
+        submitted = st.form_submit_button("💾 Save Project Name")
+        if submitted:
+            if new_name.strip() and new_name.strip() != project.get("name"):
+                # Update project data in the database
+                # Create a minimal update dict containing only the fields to change
+                update_data = {"name": new_name.strip()}
+                # To update the 'data' JSON blob, we'd need to load it, update it, and save it.
+                # The save_project function is designed for full project save, but we can
+                # adapt it or create a specific update function if needed.
+                # Let's update only the 'name' column for now, as 'data' is read-only here.
+                # Need a database function to update core project columns.
+
+                # --- Create a DB function to update core project fields ---
+                conn = None
+                try:
+                    conn = sqlite3.connect(DB_FILE)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE projects SET name = ? WHERE id = ?",
+                        (new_name.strip(), project_id),
+                    )
+                    conn.commit()
+                    st.success("Project name updated successfully!")
+                    logger.info(
+                        f"Project {project_id} name updated to '{new_name.strip()}'"
+                    )
+                    # Update the project dict in session state to reflect change immediately without full reload?
+                    # Or just trigger rerun and load fresh. Rerun is simpler.
+                    st.rerun()  # Rerun to reflect name change in title etc.
+                except sqlite3.Error as e:
+                    logger.error(
+                        f"Failed to update project {project_id} name in database: {e}",
+                        exc_info=True,
+                    )
+                    st.error("Failed to update project name in database.")
+                finally:
+                    if conn:
+                        conn.close()
+
+            elif not new_name.strip():
+                st.warning("Project name cannot be empty.")
+            else:
+                st.info("No changes made to the project name.")
+
+    st.divider()
+    # --- Danger Zone ---
+    st.markdown("### Danger Zone")
+    st.warning("Deleting a project is permanent and removes all associated files.")
+
+    # Handle delete confirmation flow
+    # This uses a dedicated session state key specific to project details deletion
+    # Check if confirmation is currently active for THIS project
+    if st.session_state.get("confirming_delete_project", {}).get("id") == project_id:
+        project_to_delete = (
+            st.session_state.confirming_delete_project
+        )  # Get the stored project info
+        pname = project_to_delete.get("name", "this project")
+        pdir = project_to_delete.get("base_dir_path")
+
+        st.error(f"🔥 ARE YOU ABSOLUTELY SURE you want to delete project '{pname}'?")
+        st.caption("This action cannot be undone.")
+        confirm_cols = st.columns(2)
+        with confirm_cols[0]:
+            # Use unique keys for confirmation buttons
+            if st.button(
+                "✅ Yes, DELETE Project",
+                key=f"confirm_delete_yes_{project_id}_final",
+                type="primary",
+            ):
+                logger.info(
+                    f"User confirmed permanent deletion for project {project_id}."
+                )
+                # Perform deletion
+                deleted_db = delete_project(project_id)  # Delete from DB first
+                deleted_files = cleanup_project_directories(pdir)  # Then cleanup files
+
+                if deleted_db:
+                    st.success(f"Project '{pname}' deleted from database.")
+                else:
+                    st.error("Failed to delete project from database.")
+                # cleanup_project_directories logs its own success/failure
+
+                # Clear confirmation flag and navigate away
+                st.session_state.confirming_delete_project = None
+                st.session_state.current_project_id = (
+                    None  # Clear the currently viewed project
+                )
+                st.session_state.app_mode = (
+                    "📁 Projects"  # Go back to the projects list page
+                )
+                # Add a small delay before rerun to allow user to see success/error messages
+                time.sleep(1.5)
+                st.rerun()
+        with confirm_cols[1]:
+            if st.button(
+                "❌ Cancel Deletion", key=f"confirm_delete_no_{project_id}_final"
+            ):
+                logger.info(f"User cancelled deletion for project {project_id}.")
+                st.session_state.confirming_delete_project = (
+                    None  # Clear confirmation flag
+                )
+                st.rerun()  # Rerun to hide the confirmation UI
+
+    else:
+        # Show the initial delete button if no confirmation is pending for this project
+        delete_cols = st.columns([0.7, 0.3])  # Adjust column width for button placement
+        with delete_cols[1]:
+            if st.button(
+                "❌ Delete Project",
+                type="secondary",
+                use_container_width=True,
+                key=f"delete_project_btn_{project_id}_initial",
+            ):
+                # Set session state to trigger confirmation flow above
+                st.session_state.confirming_delete_project = (
+                    project  # Store whole project data for confirmation message
+                )
+                st.rerun()  # Rerun to show the confirmation UI
+
+
+def _show_ai_board_tab(project: dict, ai_module):
+    """Display the AI Board tab using the AI module's UI logic."""
+    # Get the selected board config from session state (set in sidebar)
+    board_config = st.session_state.get("selected_board_config", {})
+
+    if not ai_module or not hasattr(ai_module, "display_ai_board_ui"):
+        st.info(
+            "AI Board functionality is not available. Please check AI module initialization."
+        )
+        return
+    if not board_config.get("board_enabled"):
+        st.info("AI Board is disabled. Enable and configure it in the sidebar.")
+        return
+    if not board_config.get("board_members"):
+        st.info("No AI Board members selected. Configure them in the sidebar.")
+        return
+    if not board_config.get("chairperson"):
+        st.warning(
+            "No AI Board chairperson selected. Please select one in the sidebar."
+        )
+        # Allow proceeding, but chair synthesis won't work
+
+    st.subheader("🧠 AI Board of Directors Analysis")
+    st.caption("Get additional AI perspectives and scores for your clips.")
+
+    clips = project.get("clips", [])
+    if not clips:
+        st.info("This project has no clips to analyze with the AI Board.")
+        return
+
+    # Call the method within AIAnalysisModule that renders the board UI and handles logic
+    # Pass the current project and the board configuration
+    try:
+        ai_module.display_ai_board_ui(project, board_config)
+    except Exception as e:
+        logger.error(f"Error displaying/running AI Board UI: {e}", exc_info=True)
+        st.error(f"An error occurred while running the AI Board: {e}")
+
+
+# --- Main Page Function ---
+def show(project_id: str):
+    """Display details for a specific project."""
+    # Get AI Module instance (should be initialized already by openclip_app)
+    ai_module = st.session_state.get("ai_module")
+
+    # Load the full project data including clips
+    project = load_project(project_id)
+
+    if not project:
+        st.error(f"Project with ID '{project_id}' not found or could not be loaded!")
+        logger.error(f"Attempted to load project ID '{project_id}' but failed.")
+        if st.button("◀️ Back to Projects List"):
+            st.session_state.current_project_id = None
+            st.session_state.app_mode = "📁 Projects"
+            st.rerun()
+        return  # Stop execution if project not found
+
+    st.title(f"🎬 Project: {project.get('name', 'Loading...')}")  # Use get with default
+
+    # --- Header Metrics ---
+    col1, col2, col3, col4 = st.columns(4)
+    clips = project.get("clips", [])
+    clip_count = len(clips)
+    video_duration = project.get("video_info", {}).get("duration")
+    avg_score = (
+        sum(c.get("score", 0) for c in clips) / clip_count if clip_count > 0 else 0
+    )
+    highest_score = max(c.get("score", 0) for c in clips) if clips else 0
+
+    col1.metric("Clips Identified", clip_count)
+    col2.metric(
+        "Video Duration", f"{video_duration:.1f} s" if video_duration else "N/A"
+    )
+    col3.metric("Avg. Initial Score", f"{avg_score:.1f}" if clips else "N/A")
+    col4.metric(
+        "Highest Initial Score", highest_score if clips else "N/A"
+    )  # Clarify "Initial"
+
+    st.divider()
+
+    # --- Tabs ---
+    tab_keys = ["Clips", "Analytics"]
+    # Add AI Board tab if AI module is available and the board UI function exists
+    if ai_module and hasattr(ai_module, "display_ai_board_ui"):
+        tab_keys.append("🧠 AI Board")
+    tab_keys.extend(["Export", "Settings"])
+
+    # Create tabs dynamically based on available keys
+    tabs = st.tabs(tab_keys)
+    # Map tab keys to tab objects
+    tab_map = {key: tab for key, tab in zip(tab_keys, tabs)}
+
+    # --- Populate Tabs ---
+    # Use try-except around tab content to catch errors within a specific tab
+    with tab_map["Clips"]:
+        try:
+            _show_clips_tab(
+                project
+            )  # Pass only project, AI module access via session state if needed within tab?
+        except Exception as e:
+            logger.error(f"Error rendering Clips tab: {e}", exc_info=True)
+            st.error(f"An error occurred in the Clips tab: {e}")
+
+    with tab_map["Analytics"]:
+        try:
+            _show_analytics_tab(
+                project, ai_module
+            )  # Pass ai_module for enhanced analytics
+        except Exception as e:
+            logger.error(f"Error rendering Analytics tab: {e}", exc_info=True)
+            st.error(f"An error occurred in the Analytics tab: {e}")
+
+    # Only try to populate the AI Board tab if it was added to tab_keys
+    if "🧠 AI Board" in tab_map:
+        with tab_map["🧠 AI Board"]:
+            try:
+                _show_ai_board_tab(project, ai_module)  # Pass ai_module and project
+            except Exception as e:
+                logger.error(f"Error rendering AI Board tab: {e}", exc_info=True)
+                st.error(f"An error occurred in the AI Board tab: {e}")
+
+    with tab_map["Export"]:
+        try:
+            _show_export_tab(project, ai_module)  # Pass ai_module for optimized export
+        except Exception as e:
+            logger.error(f"Error rendering Export tab: {e}", exc_info=True)
+            st.error(f"An error occurred in the Export tab: {e}")
+
+    with tab_map["Settings"]:
+        try:
+            _show_settings_tab(
+                project, ai_module
+            )  # Pass ai_module if settings relate to AI config
+        except Exception as e:
+            logger.error(f"Error rendering Settings tab: {e}", exc_info=True)
+            st.error(f"An error occurred in the Settings tab: {e}")
+
+    st.divider()
+    # "Back to Projects List" button at the bottom
+    if st.button("◀️ Back to Projects List", key="back_btn_project_detail"):
+        st.session_state.current_project_id = None  # Clear the current project ID
+        st.session_state.app_mode = (
+            "📁 Projects"  # Explicitly set mode to projects list
+        )
+        st.rerun()

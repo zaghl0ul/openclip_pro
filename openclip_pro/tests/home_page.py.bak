@@ -1,0 +1,219 @@
+import streamlit as st
+import datetime
+import os
+import logging  # Import logging
+
+from database import load_projects, delete_project  # Use DB functions
+from media_utils import cleanup_project_directories  # Use media utils
+
+logger = logging.getLogger(__name__)
+
+
+def show():
+    """Display the Home dashboard."""
+    st.title("🏠 OpenClip Pro Dashboard")
+    st.markdown("##### AI-Powered Video Analysis & Clipping")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("➕ New Project", use_container_width=True):
+            st.session_state.app_mode = "🎬 Create New"
+            st.rerun()
+    with col2:
+        if st.button("📁 View All Projects", use_container_width=True):
+            st.session_state.app_mode = "📁 Projects"
+            st.rerun()
+
+    st.divider()
+
+    # Handle project deletion confirmation if triggered from Home
+    # This uses a dedicated session state key for confirmation from THIS page
+    if st.session_state.get("confirm_delete_home"):
+        project_info = st.session_state.confirm_delete_home
+        pid = project_info["id"]
+        pname = project_info["name"]
+        pdir = project_info["dir"]
+
+        st.warning(f"⚠️ Confirm permanent deletion of project '{pname}'?")
+        st.caption(
+            "This will delete the database entry and attempt to remove associated files."
+        )
+        confirm_cols = st.columns(2)
+        with confirm_cols[0]:
+            if st.button("✅ Yes, Delete Permanently", key=f"confirm_del_yes_{pid}"):
+                logger.info(
+                    f"User confirmed deletion for project {pid} from Home page."
+                )
+                deleted_db = delete_project(pid)
+                deleted_files = cleanup_project_directories(
+                    pdir
+                )  # cleanup returns True/False
+
+                if deleted_db:
+                    st.success(f"Project '{pname}' deleted from database.")
+                else:
+                    st.error("Failed to delete project from database.")
+                # cleanup_project_directories logs its own success/failure
+
+                st.session_state.confirm_delete_home = None  # Clear confirmation state
+                st.rerun()  # Rerun to remove the deleted project from the list and confirmation UI
+        with confirm_cols[1]:
+            if st.button("❌ Cancel", key=f"confirm_del_no_{pid}"):
+                logger.info(
+                    f"User cancelled deletion for project {pid} from Home page."
+                )
+                st.session_state.confirm_delete_home = None
+                st.rerun()
+        # Stop further rendering on this page while confirmation is active
+        return  # Important: stop processing the rest of the page until confirmation is handled
+
+    # Load project headers for dashboard overview
+    # The modified load_projects now includes top clip thumbnail and score
+    projects = load_projects()
+
+    if projects:
+        st.subheader("📊 Activity Summary")
+        total_projects = len(projects)
+        # clip_count is now available directly in the project headers from load_projects
+        total_clips_all_projects = sum(p.get("clip_count", 0) for p in projects)
+
+        # Find the overall highest score from all loaded projects
+        all_top_scores = [p.get("top_clip_score", 0) for p in projects]
+        overall_highest_score = max(all_top_scores) if all_top_scores else 0
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Projects", total_projects)
+        col2.metric("Total Clips Generated", total_clips_all_projects)
+        col3.metric(
+            "Highest Clip Score (Overall)",
+            overall_highest_score if overall_highest_score > 0 else "N/A",
+        )
+
+        st.subheader("📂 Recent Projects")
+        # Display max 3 recent projects
+        for project_header in projects[:3]:
+            # Use header info directly from load_projects
+            pid = project_header["id"]
+            pname = project_header["name"]
+            pdir = project_header["base_dir_path"]
+            clip_count = project_header.get("clip_count", 0)
+            created_at = project_header.get("created_at")
+            created_str = "Unknown Date"
+            if created_at:
+                try:
+                    created_str = datetime.datetime.fromisoformat(created_at).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                except (ValueError, TypeError):
+                    pass  # Handle potential errors in date format
+
+            # Get top clip info directly from the header
+            top_clip_thumbnail = project_header.get("top_clip_thumbnail")
+            top_clip_score = project_header.get("top_clip_score", 0)
+
+            expander_title = (
+                f"**{pname}** ({clip_count} clips) - Created: {created_str}"
+            )
+
+            # Use a unique key for the expander
+            with st.expander(expander_title, key=f"home_expander_{pid}"):
+                # Display basic project info without loading full project details again
+                # Full details are loaded only when "View Project" is clicked
+
+                col_thumb, col_details, col_action = st.columns([1, 3, 1])
+
+                with col_thumb:
+                    # Display thumbnail of the highest-scoring clip (if available in header)
+                    if top_clip_thumbnail and os.path.exists(top_clip_thumbnail):
+                        try:
+                            st.image(
+                                top_clip_thumbnail,
+                                use_column_width=True,
+                                caption=f"Top Clip (Score: {top_clip_score})",
+                            )
+                        except Exception as img_err:
+                            logger.warning(
+                                f"Error loading thumbnail for project {pid}: {img_err}"
+                            )
+                            st.caption(f"Thumb Err: {img_err}")
+                    else:
+                        st.caption("No Preview")
+
+                with col_details:
+                    st.markdown(
+                        f"**Source:** {project_header.get('source_type', 'Unknown').capitalize()}"
+                    )
+                    source_path = project_header.get("source_path", "N/A")
+                    if project_header.get("source_type") == "youtube":
+                        st.markdown(f"**URL:** [{source_path}]({source_path})")
+                    else:
+                        # Show only filename for uploads, truncate long paths
+                        display_path = os.path.basename(source_path)
+                        if len(display_path) > 50:
+                            display_path = "..." + display_path[-47:]
+                        st.markdown(f"**File:** {display_path}")
+
+                    # Note: We cannot easily display Top Tag/Quip/Categories here
+                    # without loading full clip data. Keep it simple for home overview.
+                    if clip_count > 0:
+                        st.markdown(f"**Highest Score:** {top_clip_score}")
+                    else:
+                        st.markdown("_(No clips identified)_")
+
+                with col_action:
+                    if st.button(
+                        "View Project", key=f"view_home_{pid}", use_container_width=True
+                    ):
+                        st.session_state.current_project_id = pid
+                        st.session_state.app_mode = "📁 Projects"
+                        st.rerun()
+                    # Use different key suffix to distinguish from list/gallery page delete buttons
+                    if st.button(
+                        "Delete Project",
+                        key=f"delete_home_action_{pid}",
+                        type="secondary",
+                        use_container_width=True,
+                    ):
+                        # Set state for confirmation dialog on this page
+                        st.session_state.confirm_delete_home = {
+                            "id": pid,
+                            "name": pname,
+                            "dir": pdir,
+                        }
+                        st.rerun()
+
+    else:
+        st.info("👋 No projects yet. Create one to get started!", icon="💡")
+        # ... (rest of the How It Works section) ...
+        st.subheader("How It Works")
+
+        st.markdown(
+            """
+        1. **Upload** a video or enter a YouTube link
+        2. **Analyze** with AI to identify engaging moments
+        3. **Generate** clips automatically based on the analysis
+        4. **Export** clips for social media, presentations, or other uses
+
+        OpenClip Pro uses advanced AI models to analyze your videos and identify the most engaging segments.
+        It can detect visual content, analyze sentiment, and even generate engaging captions for your clips!
+        """
+        )
+
+        st.subheader("Features")
+        features_cols = st.columns(2)
+        with features_cols[0]:
+            st.markdown(
+                """
+            - **AI-Powered Analysis**: Multiple AI models to analyze your videos
+            - **Automatic Clip Generation**: Generate clips with just a few clicks
+            - **Social Media Ready**: Export clips optimized for different platforms
+            """
+            )
+        with features_cols[1]:
+            st.markdown(
+                """
+            - **Custom Scoring**: Find the most engaging moments automatically
+            - **Board of AI Directors**: Get multiple AI perspectives on your content
+            - **Detailed Analytics**: See what makes your videos engaging
+            """
+            )

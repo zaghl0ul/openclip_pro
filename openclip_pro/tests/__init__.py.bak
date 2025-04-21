@@ -1,0 +1,82 @@
+# This file contains the initialization logic for the AI module.
+import os
+import sys
+import logging
+import time
+import importlib.util
+import asyncio  # Import asyncio
+
+import streamlit as st
+
+logger = logging.getLogger(__name__)
+
+
+def initialize_ai_integration():
+    """
+    Initialize the AI module and handle dependency availability.
+    Caches the module instance in session state for reuse.
+
+    Returns:
+        AIAnalysisModule instance or None if initialization fails
+    """
+    # Check if already initialized in session state
+    if "ai_module" in st.session_state and st.session_state.ai_module:
+        logger.debug("Using cached AI module from session state")
+        return st.session_state.ai_module
+
+    # Log initialization start
+    logger.info("Initializing AI integration...")
+    start_time = time.time()
+
+    # Check for required dependencies (these are checked before AIAnalysisModule import)
+    # The AIAnalysisModule handles checking for *optional* provider dependencies internally.
+
+    # Add API Keys mode to navigation if not already added
+    # This ensures the menu item appears if the AI module initializes at all
+    if "ai_integration_modes" not in st.session_state:
+        st.session_state.ai_integration_modes = ["🔑 API Keys"]
+
+    try:
+        # Import the main AI module class
+        # This will also import ai_models and ui_components implicitly
+        from .ai_models import AIAnalysisModule
+
+        # Create instance
+        ai_module = AIAnalysisModule()
+
+        # Perform async initial setup if needed (e.g., connecting to Ollama)
+        # This needs to run in an event loop. Since this is outside Streamlit's
+        # request handling, we can run it with asyncio.run. However, if this
+        # is called *during* a Streamlit request, it might interfere with
+        # Streamlit's internal event loop use if any.
+        # A safer approach might be to lazy-initialize clients or ensure
+        # client initialization is handled by the AIClientFactory only when needed.
+        # For now, let's assume the AIAnalysisModule init itself is lightweight
+        # and client connections happen on first use via AIClientFactory.
+        # If async init is truly needed, Streamlit Components API or external loop mgmt is better.
+        # async def _async_init(module):
+        #     # Example: await module.check_connections()
+        #     pass
+        # asyncio.run(_async_init(ai_module))
+        logger.debug("AIAnalysisModule instance created.")
+
+        # Cache in session state
+        st.session_state.ai_module = ai_module
+        st.session_state.model_registry = (
+            ai_module.model_registry
+        )  # Also cache registry reference
+
+        logger.info(
+            f"AI integration initialized successfully in {time.time() - start_time:.2f}s"
+        )
+        return ai_module
+
+    except ImportError as ie:
+        logger.error(f"Required AI dependency missing: {ie}", exc_info=True)
+        st.error(f"Fatal Error: Missing AI dependency ({ie}). Please install it.")
+        # Optionally add a button to show requirements.txt or suggest `pip install -r requirements.txt`
+        return None
+    except Exception as e:
+        logger.error(f"Failed to initialize AI module: {e}", exc_info=True)
+        st.error(f"Fatal Error: Failed to initialize AI integration ({e}). Check logs.")
+        return None

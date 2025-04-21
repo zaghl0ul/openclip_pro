@@ -1,0 +1,38 @@
+import os
+import logging
+
+# Basic App Configuration
+APP_NAME = "OpenClip Pro"
+APP_VERSION = "1.1"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Database Configuration
+# Use a dot directory for configuration/data files
+DB_DIR = os.path.join(os.path.expanduser("~"), ".openclip")
+DB_FILE = os.path.join(DB_DIR, "openclip.db")
+# API Key file should be in the secure config directory
+API_KEY_FILE = os.path.join(DB_DIR, "api_keys.json")
+
+# Logging Configuration
+LOGGING_CONFIG = {
+    "level": logging.INFO,
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "datefmt": "%Y-%m-%d %H:%M:%S",
+}
+
+# Default Paths
+# Store temp files that aren't explicitly part of a project here
+DEFAULT_TEMP_DIR = os.path.join(
+    os.path.expanduser("~"), ".openclip_temp"
+)  # Using dot directory
+
+# AI Configurations
+DEFAULT_API_TIMEOUT = 120  # Timeout in seconds for AI API calls
+
+# Ensure configuration directories exist on import
+try:
+    os.makedirs(DB_DIR, exist_ok=True)
+    os.makedirs(DEFAULT_TEMP_DIR, exist_ok=True)
+except OSError as e:
+    logging.error(f"Failed to create necessary configuration directories: {e}")
+    # Depending on severity, you might exit here or handle it upstream

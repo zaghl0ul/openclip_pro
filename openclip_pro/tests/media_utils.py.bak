@@ -1,0 +1,757 @@
+"""
+Media utilities for video processing, clip generation, and thumbnail creation.
+"""
+
+import os
+import shutil
+import logging
+import tempfile
+import subprocess
+import hashlib
+import base64
+from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+# ---- Project directory management ----
+
+
+def create_project_directories(base_dir: str) -> dict:
+    """Create all required directories for a project."""
+    # Define standard subdirectories
+    subdirs = [
+        "clips",  # Generated video clips
+        "thumbnails",  # Thumbnails for clips
+        "exports",  # Exported final clips
+        "temp",  # Temporary files
+        "frames",  # Extracted frames
+    ]
+
+    result = {}
+    # Create base_dir if it doesn't exist
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        result["base"] = base_dir
+    except OSError as e:
+        logger.error(f"Failed to create base directory {base_dir}: {e}")
+        raise
+
+    # Create subdirectories
+    for subdir in subdirs:
+        try:
+            path = os.path.join(base_dir, subdir)
+            os.makedirs(path, exist_ok=True)
+            result[subdir] = path
+        except OSError as e:
+            logger.error(f"Failed to create subdirectory {subdir} at {path}: {e}")
+            raise
+
+    return result
+
+
+def cleanup_project_directories(base_dir: str) -> bool:
+    """Remove all project directories and files."""
+    if not os.path.exists(base_dir):
+        logger.warning(
+            f"Project directory {base_dir} doesn't exist, nothing to clean up."
+        )
+        return True  # Nothing to clean up is a success
+
+    try:
+        # Use shutil.rmtree to remove directory and all contents
+        shutil.rmtree(base_dir)
+        logger.info(
+            f"Successfully removed project directory {base_dir} and all contents."
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to clean up project directory {base_dir}: {e}")
+        return False
+
+
+# ---- Video Processing Functions ----
+
+
+def get_video_metadata(video_path: str) -> dict:
+    """
+    Get metadata from a video file using ffprobe.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        Dictionary with keys like duration, width, height, fps, etc.
+    """
+    if not os.path.exists(video_path):
+        logger.error(f"Video file not found: {video_path}")
+        return {}
+
+    metadata = {}
+
+    try:
+        # Run ffprobe to get video info
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration,r_frame_rate,bit_rate,codec_name",
+            "-show_entries",
+            "format=duration,size",
+            "-of",
+            "json",
+            video_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"ffprobe error: {result.stderr}")
+            return {}
+
+        import json
+
+        data = json.loads(result.stdout)
+
+        # Extract stream info
+        if "streams" in data and len(data["streams"]) > 0:
+            stream = data["streams"][0]
+            metadata["width"] = stream.get("width")
+            metadata["height"] = stream.get("height")
+
+            # Parse frame rate (could be in "num/denom" format)
+            fps_str = stream.get("r_frame_rate", "0/1")
+            if "/" in fps_str:
+                num, denom = map(int, fps_str.split("/"))
+                metadata["fps"] = num / denom if denom else 0
+            else:
+                metadata["fps"] = float(fps_str)
+
+            metadata["codec"] = stream.get("codec_name")
+            metadata["bitrate"] = stream.get("bit_rate")
+
+            # Duration might be in stream or format section
+            if "duration" in stream:
+                metadata["duration"] = float(stream["duration"])
+
+        # Extract format info
+        if "format" in data:
+            if "duration" not in metadata and "duration" in data["format"]:
+                metadata["duration"] = float(data["format"]["duration"])
+            metadata["size"] = int(data["format"].get("size", 0))
+
+        # Get extra metadata like creation time if available
+        cmd_extra = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags",
+            "-of",
+            "json",
+            video_path,
+        ]
+        result_extra = subprocess.run(cmd_extra, capture_output=True, text=True)
+
+        if result_extra.returncode == 0:
+            try:
+                tags_data = json.loads(result_extra.stdout)
+                if "format" in tags_data and "tags" in tags_data["format"]:
+                    tags = tags_data["format"]["tags"]
+                    # Copy all tags to metadata with a tags_ prefix
+                    for key, value in tags.items():
+                        metadata[f"tags_{key.lower()}"] = value
+            except json.JSONDecodeError:
+                pass  # Ignore tag parsing errors
+
+        return metadata
+
+    except Exception as e:
+        logger.error(f"Error getting video metadata: {e}")
+        return {}
+
+
+def analyze_audio(video_path: str) -> dict:
+    """
+    Analyze audio track of video file.
+
+    Args:
+        video_path: Path to the video file.
+
+    Returns:
+        Dictionary with audio metadata.
+    """
+    if not os.path.exists(video_path):
+        logger.error(f"Video file not found: {video_path}")
+        return {}
+
+    audio_info = {}
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name,channels,sample_rate,bit_rate,duration",
+            "-of",
+            "json",
+            video_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"ffprobe error analyzing audio: {result.stderr}")
+            return {}
+
+        import json
+
+        data = json.loads(result.stdout)
+
+        if "streams" in data and len(data["streams"]) > 0:
+            stream = data["streams"][0]
+            audio_info["codec"] = stream.get("codec_name")
+            audio_info["channels"] = stream.get("channels")
+            audio_info["sample_rate"] = stream.get("sample_rate")
+            audio_info["bitrate"] = stream.get("bit_rate")
+            audio_info["duration"] = float(stream.get("duration", 0))
+            return audio_info
+        else:
+            logger.warning(f"No audio stream found in {video_path}")
+            return {}
+
+    except Exception as e:
+        logger.error(f"Error analyzing audio: {e}")
+        return {}
+
+
+def download_youtube_video(
+    url: str, quality: str = "720p", temp_dir: str = None
+) -> Optional[str]:
+    """
+    Download a YouTube video using youtube-dl or yt-dlp.
+
+    Args:
+        url: YouTube URL.
+        quality: Desired quality (e.g., "720p", "1080p").
+        temp_dir: Directory to save the downloaded file.
+
+    Returns:
+        Path to the downloaded video or None if failed.
+    """
+    if not temp_dir:
+        temp_dir = tempfile.mkdtemp()
+
+    # Generate a filename based on URL hash
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
+    output_file = os.path.join(temp_dir, f"downloaded_video_{url_hash}.mp4")
+
+    try:
+        # Try using yt-dlp first (more modern), fall back to youtube-dl
+        yt_tools = ["yt-dlp", "youtube-dl"]
+
+        for tool in yt_tools:
+            try:
+                logger.info(f"Attempting to download {url} using {tool}...")
+                cmd = [
+                    tool,
+                    "--format",
+                    f"bestvideo[height<={quality[:-1]}]+bestaudio/best[height<={quality[:-1]}]",
+                    "--merge-output-format",
+                    "mp4",
+                    "--output",
+                    output_file,
+                    url,
+                ]
+
+                process = subprocess.run(cmd, capture_output=True, text=True)
+
+                if process.returncode == 0:
+                    if os.path.exists(output_file):
+                        logger.info(f"Successfully downloaded {url} to {output_file}")
+                        return output_file
+                else:
+                    logger.warning(f"{tool} download failed: {process.stderr}")
+                    continue  # Try next tool if available
+
+            except FileNotFoundError:
+                logger.warning(f"{tool} not found, trying alternative...")
+                continue
+
+        # If we get here, all download attempts failed
+        logger.error(f"All download attempts failed for {url}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Error downloading YouTube video: {e}")
+        return None
+
+
+def generate_clips(
+    input_filepath: str,
+    segments: List[Tuple[float, float]],
+    output_dir: str,
+    export_format: str = "web_optimized",
+    max_workers: int = 4,
+) -> List[Dict]:
+    """
+    Generate video clips from a source video.
+
+    Args:
+        input_filepath: Path to the source video.
+        segments: List of (start_time, end_time) tuples in seconds.
+        output_dir: Directory to save the generated clips.
+        export_format: Format/preset for encoding ("web_optimized", "high_quality", or "copy_only").
+        max_workers: Maximum number of concurrent encoding processes.
+
+    Returns:
+        List of dictionaries with information about each generated clip.
+    """
+    if not os.path.exists(input_filepath):
+        logger.error(f"Source video not found: {input_filepath}")
+        return []
+
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Failed to create output directory {output_dir}: {e}")
+            return []
+
+    # Validate segments
+    valid_segments = []
+    for i, (start, end) in enumerate(segments):
+        if end <= start:
+            logger.warning(
+                f"Skipping invalid segment {i}: end time {end} <= start time {start}"
+            )
+            continue
+        if start < 0:
+            logger.warning(
+                f"Adjusting negative start time in segment {i}: {start} -> 0"
+            )
+            start = 0
+        valid_segments.append((start, end))
+
+    if not valid_segments:
+        logger.warning("No valid segments to process.")
+        return []
+
+    # Prepare encoding settings based on format
+    encoding_params = {}
+    if export_format == "web_optimized":
+        encoding_params = {
+            "vcodec": "libx264",
+            "preset": "medium",
+            "crf": "24",
+            "acodec": "aac",
+            "audio_bitrate": "128k",
+        }
+    elif export_format == "high_quality":
+        encoding_params = {
+            "vcodec": "libx264",
+            "preset": "slow",
+            "crf": "18",
+            "acodec": "aac",
+            "audio_bitrate": "192k",
+        }
+    elif export_format == "copy_only":
+        encoding_params = {"vcodec": "copy", "acodec": "copy"}
+    else:
+        logger.warning(f"Unknown export format '{export_format}', using web_optimized")
+        encoding_params = {
+            "vcodec": "libx264",
+            "preset": "medium",
+            "crf": "24",
+            "acodec": "aac",
+            "audio_bitrate": "128k",
+        }
+
+    results = []
+
+    # Function to process a single segment
+    def process_segment(idx, start_time, end_time):
+        # Format start/end times to a nice string for filename
+        start_str = f"{start_time:.2f}".replace(".", "_")
+        end_str = f"{end_time:.2f}".replace(".", "_")
+
+        # Create output filename
+        base_name = os.path.basename(input_filepath)
+        base_name = os.path.splitext(base_name)[0]  # Remove extension
+        output_filename = f"{base_name}_clip_{start_str}_{end_str}.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+
+        try:
+            # Build ffmpeg command
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_filepath,
+                "-ss",
+                str(start_time),
+                "-to",
+                str(end_time),
+            ]
+
+            # Add encoding parameters
+            for key, value in encoding_params.items():
+                if key == "vcodec":
+                    cmd.extend(["-c:v", value])
+                elif key == "acodec":
+                    cmd.extend(["-c:a", value])
+                elif key == "preset":
+                    cmd.extend(["-preset", value])
+                elif key == "crf":
+                    cmd.extend(["-crf", value])
+                elif key == "audio_bitrate":
+                    cmd.extend(["-b:a", value])
+
+            # Add output file
+            cmd.append(output_path)
+
+            # Run ffmpeg
+            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
+            process = subprocess.run(cmd, capture_output=True, text=True)
+
+            if process.returncode != 0:
+                logger.error(f"ffmpeg error generating clip {idx}: {process.stderr}")
+                return {
+                    "index": idx,
+                    "start": start_time,
+                    "end": end_time,
+                    "success": False,
+                    "error": process.stderr,
+                    "path": None,
+                }
+
+            logger.info(f"Successfully generated clip {idx}: {output_path}")
+            return {
+                "index": idx,
+                "start": start_time,
+                "end": end_time,
+                "success": True,
+                "path": output_path,
+                "duration": end_time - start_time,
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating clip {idx}: {e}")
+            return {
+                "index": idx,
+                "start": start_time,
+                "end": end_time,
+                "success": False,
+                "error": str(e),
+                "path": None,
+            }
+
+    # Use ThreadPoolExecutor to process segments in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for idx, (start, end) in enumerate(valid_segments):
+            future = executor.submit(process_segment, idx, start, end)
+            futures.append(future)
+
+        # Collect results as they complete
+        for future in futures:
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                logger.error(f"Error in clip generation thread: {e}")
+
+    return results
+
+
+def generate_thumbnail(
+    video_path: str, time_sec: float, output_dir: str
+) -> Optional[str]:
+    """
+    Generate a thumbnail image from a video at the specified time.
+
+    Args:
+        video_path: Path to the video file.
+        time_sec: Time position in seconds for the thumbnail.
+        output_dir: Directory to save the thumbnail.
+
+    Returns:
+        Path to the generated thumbnail or None if failed.
+    """
+    if not os.path.exists(video_path):
+        logger.error(f"Video file not found: {video_path}")
+        return None
+
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Failed to create output directory {output_dir}: {e}")
+            return None
+
+    # Create output filename
+    base_name = os.path.basename(video_path)
+    base_name = os.path.splitext(base_name)[0]  # Remove extension
+    time_str = f"{time_sec:.2f}".replace(".", "_")
+    output_filename = f"{base_name}_thumb_{time_str}.jpg"
+    output_path = os.path.join(output_dir, output_filename)
+
+    try:
+        # Build ffmpeg command
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(time_sec),
+            "-i",
+            video_path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",  # High quality
+            output_path,
+        ]
+
+        # Run ffmpeg
+        logger.debug(f"Running ffmpeg thumbnail command: {' '.join(cmd)}")
+        process = subprocess.run(cmd, capture_output=True, text=True)
+
+        if process.returncode != 0:
+            logger.error(f"ffmpeg error generating thumbnail: {process.stderr}")
+            return None
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(f"Successfully generated thumbnail: {output_path}")
+            return output_path
+        else:
+            logger.error(f"Thumbnail file not created or is empty: {output_path}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error generating thumbnail: {e}")
+        return None
+
+
+def optimize_and_encode_image(
+    image_path: str, quality: int = 85, max_resolution: int = 720
+) -> Optional[str]:
+    """
+    Optimize an image (resize if needed) and encode it to base64.
+
+    Args:
+        image_path: Path to the image file.
+        quality: JPEG quality (1-100).
+        max_resolution: Maximum width or height.
+
+    Returns:
+        Base64 encoded string of the optimized image or None if failed.
+    """
+    try:
+        # Check if PIL/Pillow is available for image manipulation
+        try:
+            from PIL import Image
+
+            pillow_available = True
+        except ImportError:
+            pillow_available = False
+            logger.warning(
+                "PIL/Pillow not available. Using simple base64 encoding without optimization."
+            )
+
+        if pillow_available:
+            # Open and resize image if needed
+            img = Image.open(image_path)
+            width, height = img.size
+
+            # Resize if either dimension exceeds max_resolution
+            if width > max_resolution or height > max_resolution:
+                # Calculate new dimensions maintaining aspect ratio
+                if width > height:
+                    new_width = max_resolution
+                    new_height = int(height * (max_resolution / width))
+                else:
+                    new_height = max_resolution
+                    new_width = int(width * (max_resolution / height))
+
+                img = img.resize((new_width, new_height), Image.LANCZOS)
+                logger.debug(
+                    f"Resized image from {width}x{height} to {new_width}x{new_height}"
+                )
+
+            # Save to a temporary file with specified quality
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
+                temp_path = tmp_file.name
+
+            img.save(temp_path, "JPEG", quality=quality, optimize=True)
+
+            # Read and encode the optimized image
+            with open(temp_path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("utf-8")
+
+            # Remove temp file
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.warning(f"Could not delete temporary file {temp_path}: {e}")
+
+            return encoded
+
+        else:
+            # Simple encoding without optimization if PIL is not available
+            with open(image_path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("utf-8")
+            return encoded
+
+    except Exception as e:
+        logger.error(f"Error optimizing and encoding image {image_path}: {e}")
+        return None
+
+
+def generate_clip_analytics_data(clips: List[Dict]) -> Dict:
+    """
+    Generate analytics data from clips for visualization and reporting.
+
+    Args:
+        clips: List of clip dictionaries with metadata.
+
+    Returns:
+        Dictionary with stats, raw_data, and other analytics info.
+    """
+    if not clips:
+        logger.warning("No clips data provided for analytics generation")
+        return {"stats": {}, "raw_data": []}
+
+    try:
+        # Prepare raw data (flatten/extract relevant fields from clips)
+        raw_data = []
+        for clip in clips:
+            clip_data = {
+                "id": clip.get("id", ""),
+                "start": clip.get("start", 0),
+                "end": clip.get("end", 0),
+                "duration": clip.get("end", 0) - clip.get("start", 0),
+                "score": clip.get("score", 0),
+                "category": clip.get("category", "Unknown"),
+                "tag": clip.get("tag", ""),
+                "quip": clip.get("quip", ""),
+                "clip_path": clip.get("clip_path"),
+                "thumbnail": clip.get("thumbnail"),
+                "ai_viral_score": clip.get("ai_viral_score"),
+                "ai_monetization_score": clip.get("ai_monetization_score"),
+                "ai_tags": clip.get("ai_tags", []),
+                "ai_recommendations": clip.get("ai_recommendations", []),
+            }
+            raw_data.append(clip_data)
+
+        # Calculate statistics
+        total_clips = len(clips)
+        total_ai_analyzed = sum(
+            1
+            for c in clips
+            if c.get("ai_viral_score") is not None
+            or c.get("ai_monetization_score") is not None
+        )
+
+        # Score statistics
+        scores = [c.get("score", 0) for c in clips]
+        avg_score = sum(scores) / len(scores) if scores else 0
+        max_score = max(scores) if scores else 0
+        min_score = min(scores) if scores else 0
+
+        # Duration statistics
+        durations = [max(0, c.get("end", 0) - c.get("start", 0)) for c in clips]
+        avg_duration = sum(durations) / len(durations) if durations else 0
+        total_duration = sum(durations)
+
+        # Category statistics
+        categories = {}
+        for clip in clips:
+            cat = clip.get("category", "Unknown")
+            categories[cat] = categories.get(cat, 0) + 1
+        top_category = (
+            max(categories.items(), key=lambda x: x[1])[0] if categories else "N/A"
+        )
+
+        # AI score statistics (if available)
+        ai_viral_scores = [
+            c.get("ai_viral_score", 0)
+            for c in clips
+            if c.get("ai_viral_score") is not None
+        ]
+        ai_monetization_scores = [
+            c.get("ai_monetization_score", 0)
+            for c in clips
+            if c.get("ai_monetization_score") is not None
+        ]
+
+        avg_viral_score = (
+            sum(ai_viral_scores) / len(ai_viral_scores) if ai_viral_scores else 0
+        )
+        avg_monetization_score = (
+            sum(ai_monetization_scores) / len(ai_monetization_scores)
+            if ai_monetization_scores
+            else 0
+        )
+
+        # AI tag statistics
+        ai_tags_counter = {}
+        for clip in clips:
+            for tag in clip.get("ai_tags", []):
+                ai_tags_counter[tag] = ai_tags_counter.get(tag, 0) + 1
+        top_tags = sorted(ai_tags_counter.items(), key=lambda x: x[1], reverse=True)[
+            :10
+        ]
+        top_tags = [tag for tag, count in top_tags]
+
+        # AI recommendation statistics
+        all_recommendations = []
+        for clip in clips:
+            all_recommendations.extend(clip.get("ai_recommendations", []))
+        # Extract common recommendations (simple approach - exact matches)
+        recommendation_counter = {}
+        for rec in all_recommendations:
+            recommendation_counter[rec] = recommendation_counter.get(rec, 0) + 1
+        top_recommendations = sorted(
+            recommendation_counter.items(), key=lambda x: x[1], reverse=True
+        )[:5]
+        top_recommendations = [rec for rec, count in top_recommendations]
+
+        # Compile stats
+        stats = {
+            "total_clips": total_clips,
+            "total_ai_analyzed": total_ai_analyzed,
+            "avg_score": avg_score,
+            "max_score": max_score,
+            "min_score": min_score,
+            "avg_duration": avg_duration,
+            "total_duration": total_duration,
+            "categories": categories,
+            "top_category": top_category,
+        }
+
+        # Compile AI stats if available
+        ai_stats = {
+            "avg_viral_score": avg_viral_score,
+            "avg_monetization_score": avg_monetization_score,
+            "top_tags": top_tags,
+            "top_recommendations": top_recommendations,
+        }
+
+        # Return combined analytics data
+        return {
+            "stats": stats,
+            "ai_stats": ai_stats,
+            "raw_data": raw_data,
+            # Additional chart data could be added here if needed
+        }
+
+    except Exception as e:
+        logger.error(f"Error generating clip analytics data: {e}", exc_info=True)
+        return {"stats": {}, "raw_data": [], "error": str(e)}
